@@ -2339,6 +2339,13 @@ static int stm32l4_probe(struct flash_bank *bank)
 			stm32l4_info->dual_bank_mode = true;
 			stm32l4_info->bank1_sectors = num_pages / 2;
 		}
+
+		/**
+		 * by default use the non-secure registers,
+		 * switch secure registers if TZ is enabled and RDP is LEVEL_0
+		 */
+		if (stm32l4_info->tzen && stm32l4_info->rdp == RDP_LEVEL_0)
+			stm32l4_info->flash_regs = stm32l5_s_flash_regs;
 		break;
 	case DEVID_STM32WB5XX:
 	case DEVID_STM32WB3XX:
