@@ -5970,6 +5970,11 @@ COMMAND_HANDLER(handle_target_create)
 				command_print(CMD, "-dap ?name? required when creating target");
 				retval = ERROR_COMMAND_ARGUMENT_INVALID;
 			}
+		} else if (target->has_ocmts) {
+			if (!target->ocmts_configured) {
+				command_print(CMD, "-ocmts ?name? required when creating target");
+				retval = ERROR_COMMAND_ARGUMENT_INVALID;
+			}
 		} else {
 			if (!target->tap_configured) {
 				command_print(CMD, "-tap ?name? required when creating target");
