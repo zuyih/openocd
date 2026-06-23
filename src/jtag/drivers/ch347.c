@@ -1453,11 +1453,24 @@ static int ch347_open_device(void)
 		return retval;
 	}
 
-	// Fix for CH347F on ARM64
-	// Force set configuration 1 (required on some ARM64 platforms)
-	retval = libusb_set_configuration(ch347_handle, 1);
-	if (retval != LIBUSB_SUCCESS && retval != LIBUSB_ERROR_BUSY)
-		LOG_WARNING("CH347 set_configuration failed: %s", libusb_error_name(retval));
+	// Fix for CH347F on ARM64: ensure the device is in configuration 1
+	// (required on some ARM64 platforms where it comes up unconfigured).
+	// Only issue SET_CONFIGURATION when not already in config 1: the CH347 is
+	// a composite device whose CDC-ACM (serial) interface is bound to the
+	// kernel cdc_acm driver, and re-configuring the whole device while that
+	// interface is claimed triggers the kernel warning
+	// "interface 0 claimed by cdc_acm while 'openocd' sets config #1".
+	int current_config = -1;
+	retval = libusb_get_configuration(ch347_handle, &current_config);
+	if (retval != LIBUSB_SUCCESS) {
+		LOG_WARNING("CH347 get_configuration failed: %s", libusb_error_name(retval));
+		current_config = -1;
+	}
+	if (current_config != 1) {
+		retval = libusb_set_configuration(ch347_handle, 1);
+		if (retval != LIBUSB_SUCCESS && retval != LIBUSB_ERROR_BUSY)
+			LOG_WARNING("CH347 set_configuration failed: %s", libusb_error_name(retval));
+	}
 
 	// CH347T / CH347F detection
 	// if we can claim interface 4 we found a CH347F chip; if we can claim interface 2 we found CH347T chip
