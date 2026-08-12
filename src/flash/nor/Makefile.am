@@ -74,6 +74,7 @@ NOR_DRIVERS = \
 	%D%/stmqspi.c \
 	%D%/stellaris.c \
 	%D%/stldr_driver.c \
+	%D%/stm32c5x.c \
 	%D%/stm32f1x.c \
 	%D%/stm32f2x.c \
 	%D%/stm32lx.c \
