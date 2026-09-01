@@ -177,6 +177,9 @@ m4_define([SYSFSGPIO_ADAPTER],
 m4_define([REMOTE_BITBANG_ADAPTER],
 	[[[remote_bitbang], [Remote Bitbang driver], [REMOTE_BITBANG]]])
 
+m4_define([TAS_CLIENT_ADAPTER],
+	[[[tas_client], [Infineon TAS client driver], [TAS_CLIENT]]])
+
 m4_define([LIBJAYLINK_ADAPTERS],
 	[[[jlink], [SEGGER J-Link Programmer], [JLINK]]])
 
@@ -294,6 +297,7 @@ AC_ARG_ADAPTERS([
   DMEM_ADAPTER,
   SYSFSGPIO_ADAPTER,
   REMOTE_BITBANG_ADAPTER,
+  TAS_CLIENT_ADAPTER,
   LINUXSPIDEV_ADAPTER,
   SERIAL_PORT_ADAPTERS,
   DUMMY_ADAPTER,
@@ -605,6 +609,7 @@ PROCESS_ADAPTERS([LIBGPIOD_ADAPTERS], ["x$use_libgpiod" = "xyes"], [Linux libgpi
 PROCESS_ADAPTERS([DMEM_ADAPTER], ["x$is_linux" = "xyes" -a "x$ac_cv_header_sys_mman_h" = "xyes"], [Linux /dev/mem])
 PROCESS_ADAPTERS([SYSFSGPIO_ADAPTER], ["x$is_linux" = "xyes"], [Linux sysfs])
 PROCESS_ADAPTERS([REMOTE_BITBANG_ADAPTER], [true], [unused])
+PROCESS_ADAPTERS([TAS_CLIENT_ADAPTER], [true], [unused])
 PROCESS_ADAPTERS([CMSIS_DAP_TCP_ADAPTER], [true], [unused])
 PROCESS_ADAPTERS([LIBJAYLINK_ADAPTERS], ["x$use_internal_libjaylink" = "xyes" -o "x$use_libjaylink" = "xyes"], [libjaylink-0.2])
 PROCESS_ADAPTERS([XVC_ADAPTERS],
@@ -821,6 +826,7 @@ m4_foreach([adapter_driver], [USB1_ADAPTERS,
 	DMEM_ADAPTER,
 	SYSFSGPIO_ADAPTER,
 	REMOTE_BITBANG_ADAPTER,
+	TAS_CLIENT_ADAPTER,
 	LIBJAYLINK_ADAPTERS, XVC_ADAPTERS,
 	SERIAL_PORT_ADAPTERS,
 	PARALLEL_PORT_ADAPTER,

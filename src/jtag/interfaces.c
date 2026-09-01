@@ -172,5 +172,9 @@ struct adapter_driver *adapter_drivers[] = {
 #if BUILD_XVC == 1
 		&xvc_adapter_driver,
 #endif
+
+#if BUILD_TAS_CLIENT == 1
+		&tas_client_adapter_driver,
+#endif
 		NULL,
 };
