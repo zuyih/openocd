@@ -1862,7 +1862,7 @@ int adapter_resets(int trst, int srst)
 		return ERROR_OK;
 	} else if (transport_is_swd() || transport_is_hla() ||
 			   transport_is_dapdirect_swd() || transport_is_dapdirect_jtag() ||
-			   transport_is_swim()) {
+			   transport_is_swim() || transport_is_tas()) {
 		if (trst == TRST_ASSERT) {
 			LOG_ERROR("transport %s has no trst signal",
 				get_current_transport_name());
@@ -1896,7 +1896,7 @@ int adapter_assert_reset(void)
 		return ERROR_OK;
 	} else if (transport_is_swd() || transport_is_hla() ||
 			   transport_is_dapdirect_jtag() || transport_is_dapdirect_swd() ||
-			   transport_is_swim())
+			   transport_is_swim() || transport_is_tas())
 		return adapter_system_reset(1);
 	else if (get_current_transport())
 		LOG_ERROR("reset is not supported on %s",
@@ -1913,7 +1913,7 @@ int adapter_deassert_reset(void)
 		return ERROR_OK;
 	} else if (transport_is_swd() || transport_is_hla() ||
 			   transport_is_dapdirect_jtag() || transport_is_dapdirect_swd() ||
-			   transport_is_swim())
+			   transport_is_swim() || transport_is_tas())
 		return adapter_system_reset(0);
 	else if (get_current_transport())
 		LOG_ERROR("reset is not supported on %s",

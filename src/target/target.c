@@ -85,6 +85,7 @@ static struct target_type *target_types[] = {
 	&arm966e_target,
 	&arm9tdmi_target,
 	&armv8r_target,
+	&aurix_target,
 	&avr32_ap7k_target,
 	&avr_target,
 	&cortexa_target,
@@ -5922,6 +5923,11 @@ COMMAND_HANDLER(handle_target_create)
 		if (target->has_dap) {
 			if (!target->dap_configured) {
 				command_print(CMD, "-dap ?name? required when creating target");
+				retval = ERROR_COMMAND_ARGUMENT_INVALID;
+			}
+		} else if (target->has_ocds) {
+			if (!target->ocds_configured) {
+				command_print(CMD, "-ocds ?name? required when creating target");
 				retval = ERROR_COMMAND_ARGUMENT_INVALID;
 			}
 		} else {
