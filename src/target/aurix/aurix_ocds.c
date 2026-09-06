@@ -18,52 +18,102 @@ static OOCD_LIST_HEAD(all_ocds);
  * Known derivatives. The device_type values are the IEEE 1149.1 device IDs the
  * TAS server reports; both the initial and the A-step ID are listed where the
  * silicon uses a version nibble.
- *
- * TC3xx core windows sit at 0xF881_0000 + 0x2_0000 * n, TC4x ones at
- * 0xF881_0000 + 0x4_0000 * n.
  */
-static const struct aurix_device aurix_devices[] = {
-	/* name, type, CSFR base, stride, cores (0: unknown), DBGACT */
-	{ "tc33x",  0x0020B083, 0xF8810000, 0x20000, 0, false },
-	{ "tc33x",  0x1020B083, 0xF8810000, 0x20000, 0, false },
-	{ "tc33xe", 0x0020C083, 0xF8810000, 0x20000, 0, false },
-	{ "tc33xe", 0x1020C083, 0xF8810000, 0x20000, 0, false },
-	{ "tc35x",  0x0020A083, 0xF8810000, 0x20000, 0, false },
-	{ "tc35x",  0x1020A083, 0xF8810000, 0x20000, 0, false },
-	{ "tc36x",  0x00209083, 0xF8810000, 0x20000, 0, false },
-	{ "tc36x",  0x10209083, 0xF8810000, 0x20000, 0, false },
-	{ "tc37x",  0x00207083, 0xF8810000, 0x20000, 3, false },
-	{ "tc37x",  0x10207083, 0xF8810000, 0x20000, 3, false },
-	{ "tc37xe", 0x00208083, 0xF8810000, 0x20000, 0, false },
-	{ "tc37xe", 0x10208083, 0xF8810000, 0x20000, 0, false },
-	{ "tc38x",  0x00206083, 0xF8810000, 0x20000, 0, false },
-	{ "tc38x",  0x10206083, 0xF8810000, 0x20000, 0, false },
-	{ "tc3ex",  0x00215083, 0xF8810000, 0x20000, 0, false },
-	{ "tc3ex",  0x10215083, 0xF8810000, 0x20000, 0, false },
-	{ "tc39x",  0x00205083, 0xF8810000, 0x20000, 0, false },
-	{ "tc39x",  0x10205083, 0xF8810000, 0x20000, 0, false },
-	{ "tc39x",  0x20205083, 0xF8810000, 0x20000, 0, false },
+/*
+ * Shared properties. A core window sits 0x20000 apart on TC3xx and 0x40000 on
+ * TC4x; the debug event action lives in DBGACT from TriCore 1.8 onwards. A
+ * core count of zero means it has not been established, and so does a missing
+ * scratchpad layout, which only costs the flash loader. Core counts are filled
+ * in from the manual of the derivative, so the entries left bare are the ones
+ * whose manual was not to hand. No TC3xx carries a scratchpad layout: the
+ * loader has not been made to work on that family, and a bank is erased before
+ * it is written, so offering it there turns a failed write into a blank
+ * device.
+ */
+#define AURIX_TC3XX .csfr_base = 0xF8810000, .csfr_stride = 0x20000
 
-	{ "tc41x",  0x00218083, 0xF8810000, 0x40000, 0, true },
-	{ "tc41x",  0x10218083, 0xF8810000, 0x40000, 0, true },
-	{ "tc42x",  0x00219083, 0xF8810000, 0x40000, 0, true },
-	{ "tc42x",  0x10219083, 0xF8810000, 0x40000, 0, true },
-	{ "tc44x",  0x0021A083, 0xF8810000, 0x40000, 0, true },
-	{ "tc44x",  0x1021A083, 0xF8810000, 0x40000, 0, true },
-	{ "tc45x",  0x0021B083, 0xF8810000, 0x40000, 0, true },
-	{ "tc45x",  0x1021B083, 0xF8810000, 0x40000, 0, true },
-	{ "tc46x",  0x0021C083, 0xF8810000, 0x40000, 0, true },
-	{ "tc46x",  0x1021C083, 0xF8810000, 0x40000, 0, true },
-	{ "tc48x",  0x0021D083, 0xF8810000, 0x40000, 0, true },
-	{ "tc48x",  0x1021D083, 0xF8810000, 0x40000, 0, true },
-	{ "tc49xa", 0x0021E083, 0xF8810000, 0x40000, 0, true },
-	{ "tc49xa", 0x1021E083, 0xF8810000, 0x40000, 0, true },
-	{ "tc49x",  0x0022B083, 0xF8810000, 0x40000, 0, true },
-	{ "tc49x",  0x1022B083, 0xF8810000, 0x40000, 0, true },
-	{ "tc4dx",  0x00225083, 0xF8810000, 0x40000, 6, true },
-	{ "tc4dx",  0x10225083, 0xF8810000, 0x40000, 6, true },
-	{ "tc4rx",  0x00223083, 0xF8810000, 0x40000, 0, true },
-	{ "tc4rx",  0x10223083, 0xF8810000, 0x40000, 0, true },
+#define AURIX_TC4XX \
+	.csfr_base = 0xF8810000, .csfr_stride = 0x40000, .has_dbgact = true
+
+/* Scratchpads: DSPR of CORE_ID 0 at 0x70000000 with the next one 0x10000000
+ * lower, and the program scratchpad 1 MB above each. TC3xx and TC4Dx agree on
+ * this; they differ in how much data scratchpad a core gets. */
+#define AURIX_SPR \
+	.dspr0_base = 0x70000000, .spr_stride = 0x10000000, \
+	.pspr_offset = 0x100000
+
+/* How much data scratchpad a core gets. The smaller TC3xx give every core the
+ * same 192 KB; from TC37x on, cores 0 and 1 get 240 KB and the rest 96 KB. */
+#define AURIX_SPR_192K AURIX_SPR, .dspr_size = 192 * 1024
+
+#define AURIX_SPR_240K AURIX_SPR, .dspr_size = 240 * 1024
+
+#define AURIX_SPR_240K_96K \
+	AURIX_SPR, .dspr_size = 240 * 1024, \
+	.dspr_size_split = 2, .dspr_size_rest = 96 * 1024
+
+/*
+ * TC39x has six cores but no CORE_ID 5: its last core answers as CORE_ID 6,
+ * putting the CSFR window at 0xF88D0000 rather than the 0xF88B0000 an
+ * uninterrupted count would give, which is reserved, and the scratchpad at
+ * 0x10000000 rather than 0x20000000.
+ */
+#define AURIX_TC39X \
+	AURIX_TC3XX, .num_cores = 6, AURIX_SPR_240K_96K, .core_id_gap = 5
+
+static const struct aurix_device aurix_devices[] = {
+	{ .name = "tc33x", .device_type = 0x0020B083, AURIX_TC3XX,
+	  .num_cores = 1, AURIX_SPR_192K },
+	{ .name = "tc33x", .device_type = 0x1020B083, AURIX_TC3XX,
+	  .num_cores = 1, AURIX_SPR_192K },
+	{ .name = "tc33xe", .device_type = 0x0020C083, AURIX_TC3XX },
+	{ .name = "tc33xe", .device_type = 0x1020C083, AURIX_TC3XX },
+	{ .name = "tc35x", .device_type = 0x0020A083, AURIX_TC3XX },
+	{ .name = "tc35x", .device_type = 0x1020A083, AURIX_TC3XX },
+	{ .name = "tc36x", .device_type = 0x00209083, AURIX_TC3XX,
+	  .num_cores = 2, AURIX_SPR_192K },
+	{ .name = "tc36x", .device_type = 0x10209083, AURIX_TC3XX,
+	  .num_cores = 2, AURIX_SPR_192K },
+	{ .name = "tc37x", .device_type = 0x00207083, AURIX_TC3XX,
+	  .num_cores = 3, AURIX_SPR_240K_96K },
+	{ .name = "tc37x", .device_type = 0x10207083, AURIX_TC3XX,
+	  .num_cores = 3, AURIX_SPR_240K_96K },
+	{ .name = "tc37xe", .device_type = 0x00208083, AURIX_TC3XX,
+	  .num_cores = 3, AURIX_SPR_240K_96K },
+	{ .name = "tc37xe", .device_type = 0x10208083, AURIX_TC3XX,
+	  .num_cores = 3, AURIX_SPR_240K_96K },
+	{ .name = "tc38x", .device_type = 0x00206083, AURIX_TC3XX,
+	  .num_cores = 4, AURIX_SPR_240K_96K },
+	{ .name = "tc38x", .device_type = 0x10206083, AURIX_TC3XX,
+	  .num_cores = 4, AURIX_SPR_240K_96K },
+	{ .name = "tc3ex", .device_type = 0x00215083, AURIX_TC3XX },
+	{ .name = "tc3ex", .device_type = 0x10215083, AURIX_TC3XX },
+	{ .name = "tc39x", .device_type = 0x00205083, AURIX_TC39X },
+	{ .name = "tc39x", .device_type = 0x10205083, AURIX_TC39X },
+	{ .name = "tc39x", .device_type = 0x20205083, AURIX_TC39X },
+
+	{ .name = "tc41x", .device_type = 0x00218083, AURIX_TC4XX },
+	{ .name = "tc41x", .device_type = 0x10218083, AURIX_TC4XX },
+	{ .name = "tc42x", .device_type = 0x00219083, AURIX_TC4XX },
+	{ .name = "tc42x", .device_type = 0x10219083, AURIX_TC4XX },
+	{ .name = "tc44x", .device_type = 0x0021A083, AURIX_TC4XX },
+	{ .name = "tc44x", .device_type = 0x1021A083, AURIX_TC4XX },
+	{ .name = "tc45x", .device_type = 0x0021B083, AURIX_TC4XX },
+	{ .name = "tc45x", .device_type = 0x1021B083, AURIX_TC4XX },
+	{ .name = "tc46x", .device_type = 0x0021C083, AURIX_TC4XX },
+	{ .name = "tc46x", .device_type = 0x1021C083, AURIX_TC4XX },
+	{ .name = "tc48x", .device_type = 0x0021D083, AURIX_TC4XX },
+	{ .name = "tc48x", .device_type = 0x1021D083, AURIX_TC4XX },
+	{ .name = "tc49xa", .device_type = 0x0021E083, AURIX_TC4XX },
+	{ .name = "tc49xa", .device_type = 0x1021E083, AURIX_TC4XX },
+	{ .name = "tc49x", .device_type = 0x0022B083, AURIX_TC4XX },
+	{ .name = "tc49x", .device_type = 0x1022B083, AURIX_TC4XX },
+	{ .name = "tc4dx", .device_type = 0x00225083, AURIX_TC4XX,
+	  .num_cores = 6, AURIX_SPR_240K },
+	{ .name = "tc4dx", .device_type = 0x10225083, AURIX_TC4XX,
+	  .num_cores = 6, AURIX_SPR_240K },
+	{ .name = "tc4rx", .device_type = 0x00223083, AURIX_TC4XX },
+	{ .name = "tc4rx", .device_type = 0x10223083, AURIX_TC4XX },
 };
 
 
