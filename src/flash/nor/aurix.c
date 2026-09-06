@@ -25,6 +25,7 @@
 #include <flash/nor/driver.h>
 #include <helper/log.h>
 #include <helper/time_support.h>
+#include <target/register.h>
 #include <target/target.h>
 
 /* Command sequence offsets, relative to the variant's cmd_base. */
@@ -374,8 +375,9 @@ static int aurix_flash_load_word(struct aurix_ocds *ocds,
   return aurix_ocds_queue_soc_write_u32(ocds, v->cmd_base | reg, data);
 }
 
-static int aurix_flash_write(struct flash_bank *bank, const uint8_t *buffer,
-                             uint32_t offset, uint32_t count) {
+static int aurix_flash_write_slow(struct flash_bank *bank,
+                                  const uint8_t *buffer, uint32_t offset,
+                                  uint32_t count) {
   struct aurix_flash_bank *aurix_bank = bank->driver_priv;
   const struct aurix_flash_variant *v = aurix_bank->variant;
   struct aurix_ocds *ocds = target_to_aurix(bank->target)->ocds;
@@ -477,6 +479,227 @@ err:
   return ERROR_FLASH_OPERATION_FAILED;
 }
 
+
+/*
+ * Programming from a loader running on the core.
+ *
+ * Filling a page means writing every word to a single address, which is not a
+ * block transfer, so on the debugger's side it costs one request per word and
+ * lands at a few KiB/s. Handing the sequence to the core instead reduces the
+ * debugger's part to getting the data into RAM, which is a block transfer.
+ */
+
+static const uint8_t aurix_flash_loader[] = {
+#include "../../../contrib/loaders/flash/aurix/aurix.inc"
+};
+
+/* Laid out in the data scratchpad, clear of what an application keeps at the
+ * bottom and of the context save area at the top. */
+#define AURIX_LOADER_PARAMS_OFFSET 0x20000
+#define AURIX_LOADER_BUFFER_OFFSET 0x20100
+#define AURIX_LOADER_BUFFER_SIZE (32 * 1024)
+
+/* Sentinel the loader overwrites when it is done. */
+#define AURIX_LOADER_RUNNING 0xFFFFFFFF
+
+#define AURIX_LOADER_TIMEOUT_MS 5000
+
+/* struct params of contrib/loaders/flash/aurix/aurix.c, in words. */
+enum {
+  AURIX_LP_CMD_BASE,
+  AURIX_LP_STATUS_REG,
+  AURIX_LP_ERROR_REG,
+  AURIX_LP_ERROR_MASK,
+  AURIX_LP_DONE_MASK,
+  AURIX_LP_BUSY_MASK,
+  AURIX_LP_CLEAR_STATUS_WRITE,
+  AURIX_LP_PAGE_REG_LO,
+  AURIX_LP_PAGE_REG_HI,
+  AURIX_LP_CMD_BURST,
+  AURIX_LP_CMD_PAGE,
+  AURIX_LP_BURST_SIZE,
+  AURIX_LP_ADDRESS,
+  AURIX_LP_DATA,
+  AURIX_LP_COUNT,
+  AURIX_LP_RESULT,
+  AURIX_LP_NUM,
+};
+
+/** Whether the loader can be used on this target. */
+static bool aurix_flash_can_load(struct flash_bank *bank) {
+  struct aurix_ocds *ocds = target_to_aurix(bank->target)->ocds;
+
+  if (!aurix_ocds_dspr(ocds, bank->target->coreid))
+    return false;
+
+  return aurix_ocds_dspr_size(ocds, bank->target->coreid) >=
+         AURIX_LOADER_BUFFER_OFFSET + AURIX_LOADER_BUFFER_SIZE;
+}
+
+/**
+ * Run the loader over one buffer's worth of data.
+ *
+ * The core is left parked in the loader's final loop; the caller halts it.
+ */
+static int aurix_flash_run_loader(struct flash_bank *bank,
+                                  const struct aurix_flash_variant *v,
+                                  uint32_t address, const uint8_t *buffer,
+                                  uint32_t count) {
+  struct target *target = bank->target;
+  struct aurix_ocds *ocds = target_to_aurix(target)->ocds;
+  uint32_t dspr = aurix_ocds_dspr(ocds, target->coreid);
+  uint32_t pspr = aurix_ocds_pspr(ocds, target->coreid);
+  uint32_t params_at = dspr + AURIX_LOADER_PARAMS_OFFSET;
+  uint32_t buffer_at = dspr + AURIX_LOADER_BUFFER_OFFSET;
+  uint32_t params[AURIX_LP_NUM];
+  uint8_t words[AURIX_LP_NUM * 4];
+  int64_t start;
+  int ret;
+
+  params[AURIX_LP_CMD_BASE] = v->cmd_base;
+  params[AURIX_LP_STATUS_REG] = v->status_reg;
+  params[AURIX_LP_ERROR_REG] = v->error_reg;
+  params[AURIX_LP_ERROR_MASK] = v->error_mask;
+  params[AURIX_LP_DONE_MASK] = v->done_mask;
+  params[AURIX_LP_BUSY_MASK] = v->busy_mask;
+  params[AURIX_LP_CLEAR_STATUS_WRITE] = v->clear_status_before_write;
+  params[AURIX_LP_PAGE_REG_LO] =
+      v->page_load_alternates ? CMD_SEQ_DATA_L : CMD_SEQ_DATA_U;
+  params[AURIX_LP_PAGE_REG_HI] = CMD_SEQ_DATA_U;
+  params[AURIX_LP_CMD_BURST] = CMD_WRITE_BURST_2;
+  params[AURIX_LP_CMD_PAGE] = CMD_WRITE_PAGE_2;
+  params[AURIX_LP_BURST_SIZE] = v->burst_size;
+  params[AURIX_LP_ADDRESS] = aurix_flash_cmd_addr(v, address);
+  params[AURIX_LP_DATA] = buffer_at;
+  params[AURIX_LP_COUNT] = count;
+  params[AURIX_LP_RESULT] = AURIX_LOADER_RUNNING;
+
+  for (unsigned int i = 0; i < AURIX_LP_NUM; i++)
+    target_buffer_set_u32(target, words + i * 4, params[i]);
+
+  ret = target_write_memory(target, buffer_at, 4, count / 4, buffer);
+  if (ret != ERROR_OK)
+    return ret;
+  ret = target_write_memory(target, params_at, 4, AURIX_LP_NUM, words);
+  if (ret != ERROR_OK)
+    return ret;
+
+  /* Hand the parameter block over in the first argument register. */
+  ret = target_write_u32(
+      target, aurix_ocds_csfr(ocds, target->coreid, AURIX_CSFR_A4), params_at);
+  if (ret != ERROR_OK)
+    return ret;
+
+  ret = target_resume(target, false, pspr, false, true);
+  if (ret != ERROR_OK)
+    return ret;
+
+  start = timeval_ms();
+  for (;;) {
+    uint32_t result;
+
+    ret = target_read_u32(target,
+                          params_at + AURIX_LP_RESULT * 4, &result);
+    if (ret != ERROR_OK)
+      break;
+
+    if (result != AURIX_LOADER_RUNNING) {
+      ret = result ? ERROR_FLASH_OPERATION_FAILED : ERROR_OK;
+      if (result)
+        LOG_ERROR("%s: loader reported error register 0x%08" PRIx32, v->name,
+                  result);
+      break;
+    }
+
+    if (timeval_ms() - start > AURIX_LOADER_TIMEOUT_MS) {
+      LOG_ERROR("%s: flash loader did not finish", v->name);
+      ret = ERROR_FLASH_OPERATION_FAILED;
+      break;
+    }
+  }
+
+  /* Park the core; it is sitting in the loader's final loop. */
+  target_halt(target);
+  target_poll(target);
+
+  return ret;
+}
+
+static int aurix_flash_write_loader(struct flash_bank *bank,
+                                    const struct aurix_flash_variant *v,
+                                    const uint8_t *buffer, uint32_t offset,
+                                    uint32_t count) {
+  struct target *target = bank->target;
+  struct aurix_ocds *ocds = target_to_aurix(target)->ocds;
+  uint32_t pspr = aurix_ocds_pspr(ocds, target->coreid);
+  uint32_t pc_csfr = aurix_ocds_csfr(ocds, target->coreid, AURIX_CSFR_PC);
+  uint32_t icr_csfr = aurix_ocds_csfr(ocds, target->coreid, AURIX_CSFR_ICR);
+  uint32_t d_csfr = aurix_ocds_csfr(ocds, target->coreid, AURIX_CSFR_D0);
+  uint32_t a_csfr = aurix_ocds_csfr(ocds, target->coreid, AURIX_CSFR_A0);
+  uint8_t saved_d[16 * 4], saved_a[16 * 4];
+  uint32_t saved_pc, saved_icr;
+  uint32_t done = 0;
+  int ret;
+
+  /*
+   * The loader runs on the core and disables interrupts, so put back
+   * everything it disturbs: a resume afterwards then carries on with whatever
+   * was being debugged. The register files are contiguous, so this is two
+   * block transfers each way rather than sixty-four accesses.
+   */
+  ret = target_read_u32(target, pc_csfr, &saved_pc);
+  if (ret != ERROR_OK)
+    return ret;
+  ret = target_read_u32(target, icr_csfr, &saved_icr);
+  if (ret != ERROR_OK)
+    return ret;
+  ret = target_read_memory(target, d_csfr, 4, 16, saved_d);
+  if (ret != ERROR_OK)
+    return ret;
+  ret = target_read_memory(target, a_csfr, 4, 16, saved_a);
+  if (ret != ERROR_OK)
+    return ret;
+
+  ret = target_write_memory(target, pspr, 4,
+                            (sizeof(aurix_flash_loader) + 3) / 4,
+                            aurix_flash_loader);
+  if (ret != ERROR_OK)
+    return ret;
+
+  while (done < count) {
+    uint32_t chunk = MIN(AURIX_LOADER_BUFFER_SIZE, count - done);
+
+    ret = aurix_flash_run_loader(bank, v, bank->base + offset + done,
+                                 buffer + done, chunk);
+    if (ret != ERROR_OK)
+      break;
+
+    done += chunk;
+  }
+
+  target_write_memory(target, d_csfr, 4, 16, saved_d);
+  target_write_memory(target, a_csfr, 4, 16, saved_a);
+  target_write_u32(target, icr_csfr, saved_icr);
+  target_write_u32(target, pc_csfr, saved_pc);
+  register_cache_invalidate(target->reg_cache);
+
+  return ret;
+}
+
+static int aurix_flash_write(struct flash_bank *bank, const uint8_t *buffer,
+                             uint32_t offset, uint32_t count) {
+  struct aurix_flash_bank *aurix_bank = bank->driver_priv;
+
+  /* The loader steps a page at a time and has no tail handling; the flash
+   * core pads to the declared alignment, so this only guards against a
+   * caller that bypasses it. */
+  if (aurix_flash_can_load(bank) && (count % AURIX_PAGE_SIZE) == 0)
+    return aurix_flash_write_loader(bank, aurix_bank->variant, buffer, offset,
+                                    count);
+
+  return aurix_flash_write_slow(bank, buffer, offset, count);
+}
+
 /**
  * Fill in the per-sector write protection.
  *
@@ -545,6 +768,11 @@ static int aurix_flash_info(struct flash_bank *bank,
                          "\ncommand sequence interface at 0x%08" PRIx32
                          ", %" PRIu32 " byte bursts",
                          v->cmd_base, v->burst_size);
+
+  command_print_sameline(cmd, "\nprogrammed %s",
+                         aurix_flash_can_load(bank)
+                             ? "through a loader on the core"
+                             : "a word at a time over the debug link");
 
   if (v->protect_off_reg &&
       target_read_u32(bank->target, v->protect_off_reg, &off) == ERROR_OK &&
