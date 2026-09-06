@@ -7,6 +7,15 @@
 #include "aurix_ocds.h"
 
 
+/* CSFR offsets needed outside the target driver: the program counter, and the
+ * first argument register of the TriCore ABI, used to hand a parameter block
+ * to code running on the core. */
+#define AURIX_CSFR_PC 0xFE08
+#define AURIX_CSFR_ICR 0xFE2C
+#define AURIX_CSFR_D0 0xFF00
+#define AURIX_CSFR_A0 0xFF80
+#define AURIX_CSFR_A4 (AURIX_CSFR_A0 + 4 * 4)
+
 struct aurix_private_config {
   struct aurix_ocds *ocds;
   /* Bitmaps of the debug triggers handed out, and of which of those watch a

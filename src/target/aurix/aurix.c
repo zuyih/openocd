@@ -31,7 +31,7 @@
 #define CSFR_DBGSR 0xFD00
 #define CSFR_DBGACT 0xFD14
 #define CSFR_TRIG_ACC 0xFD30
-#define CSFR_PC 0xFE08
+#define CSFR_PC AURIX_CSFR_PC
 #define CSFR_SYSCON 0xFE14
 
 /* Set while a core waits in boot halt; it starts once software clears it. */

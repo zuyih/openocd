@@ -23,6 +23,26 @@ struct aurix_device {
    * register; on 1.6.x every event register carries its own EVTA field. Both
    * are driven, see aurix_trigger_arm(). */
   bool has_dbgact;
+
+  /* Scratchpad of core 0, and how much lower the next core's sits. The flash
+   * loader runs out of the program scratchpad and takes its data from the
+   * data one. Zero where the layout has not been established, which leaves
+   * flash programming on the slow path. */
+  uint32_t dspr0_base;
+  uint32_t spr_stride;
+  uint32_t pspr_offset;
+  uint32_t dspr_size;
+  /* Cores from dspr_size_split on have dspr_size_rest instead, which is 0
+   * where every core is the same. From TC37x on, cores 0 and 1 get 240 KB of
+   * data scratchpad and the rest 96 KB, which is too little for the loader. */
+  unsigned int dspr_size_split;
+  uint32_t dspr_size_rest;
+
+  /* A six core TC3xx leaves the CORE_ID 5 slot empty and gives its last core
+   * CORE_ID 6, which moves both the CSFR window and the scratchpad of that
+   * core one stride further along than its index would. Index of the first
+   * core affected, 0 where the cores are numbered without a gap. */
+  unsigned int core_id_gap;
 };
 
 struct aurix_ocds {
@@ -106,6 +126,44 @@ static inline int aurix_ocds_run(struct aurix_ocds *ocds) {
 int aurix_ocds_atomic_read_u32(struct aurix_ocds *ocds, target_addr_t address,
 		uint32_t *value);
 
+/** CORE_ID of a core, which is its index unless the device leaves a slot out. */
+static inline unsigned int aurix_ocds_core_id(const struct aurix_device *dev,
+                                              unsigned int coreid) {
+  if (dev->core_id_gap && coreid >= dev->core_id_gap)
+    return coreid + 1;
+
+  return coreid;
+}
+
+/** Data scratchpad of a core, or 0 if the layout is not known. */
+static inline uint32_t aurix_ocds_dspr(const struct aurix_ocds *ocds,
+                                       unsigned int coreid) {
+  if (!ocds->device->dspr0_base)
+    return 0;
+
+  return ocds->device->dspr0_base -
+         ocds->device->spr_stride * aurix_ocds_core_id(ocds->device, coreid);
+}
+
+/** Size of a core's data scratchpad, or 0 if the layout is not known. */
+static inline uint32_t aurix_ocds_dspr_size(const struct aurix_ocds *ocds,
+                                            unsigned int coreid) {
+  const struct aurix_device *dev = ocds->device;
+
+  if (dev->dspr_size_rest && coreid >= dev->dspr_size_split)
+    return dev->dspr_size_rest;
+
+  return dev->dspr_size;
+}
+
+/** Program scratchpad of a core, or 0 if the layout is not known. */
+static inline uint32_t aurix_ocds_pspr(const struct aurix_ocds *ocds,
+                                       unsigned int coreid) {
+  uint32_t dspr = aurix_ocds_dspr(ocds, coreid);
+
+  return dspr ? dspr + ocds->device->pspr_offset : 0;
+}
+
 /**
  * Absolute address of a TriCore CSFR of a given core.
  *
@@ -117,7 +175,9 @@ int aurix_ocds_atomic_read_u32(struct aurix_ocds *ocds, target_addr_t address,
 static inline uint32_t aurix_ocds_csfr(const struct aurix_ocds *ocds,
                                        unsigned int coreid, uint32_t offset) {
   assert(ocds->device);
-  return ocds->device->csfr_base + ocds->device->csfr_stride * coreid + offset;
+  return ocds->device->csfr_base +
+         ocds->device->csfr_stride * aurix_ocds_core_id(ocds->device, coreid) +
+         offset;
 }
 
 #endif
