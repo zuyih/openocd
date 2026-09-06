@@ -10,8 +10,8 @@
  * Per-derivative properties of the TriCore debug interface.
  *
  * The CSFR offsets inside a core window (DBGSR, PSW, PC, D0.., A0.., ...) are
- * defined by the TriCore architecture. What differs between derivatives is
- * where the per-core windows live and how many of them there are.
+ * defined by the TriCore architecture and are identical on TC3xx and TC4x.
+ * What differs between the families is where the per-core windows live.
  */
 struct aurix_device {
   const char *name;
@@ -19,6 +19,10 @@ struct aurix_device {
   uint32_t csfr_base;    /* CSFR window of core 0 */
   uint32_t csfr_stride;  /* distance between two core windows */
   unsigned int num_cores;
+  /* TriCore 1.8 puts the action a debug event takes in a single DBGACT
+   * register; on 1.6.x every event register carries its own EVTA field. Both
+   * are driven, see aurix_trigger_arm(). */
+  bool has_dbgact;
 };
 
 struct aurix_ocds {

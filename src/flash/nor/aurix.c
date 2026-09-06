@@ -1,13 +1,13 @@
 // SPDX-License-Identifier: GPL-2.0-or-later
 
 /*
- * PFLASH driver for Infineon AURIX.
+ * PFLASH driver for Infineon AURIX TC3xx and TC4x.
  *
- * The flash is driven through a command sequence interface: operands and
- * opcodes are written to fixed offsets (0x5554, 0xAA50, 0xAA58, 0xAAA8,
- * 0x55F0/0x55F4) of a window, and completion is polled in the DMU. Where that
- * window sits and how completion is reported is per derivative, so it is
- * collected in struct aurix_flash_variant.
+ * Both families drive the flash through the same command sequence interface:
+ * the opcodes and the offsets they are written to (0x5554, 0xAA50, 0xAA58,
+ * 0xAAA8, 0x55F0/0x55F4) are identical. What differs is where that interface
+ * is mapped, which registers report completion, how a page is filled, and the
+ * burst and physical sector geometry. See struct aurix_flash_variant.
  */
 
 #ifdef HAVE_CONFIG_H
@@ -35,7 +35,7 @@
 #define CMD_SEQ_DATA_L 0x55F0
 #define CMD_SEQ_DATA_U 0x55F4
 
-/* Command opcodes. */
+/* Command opcodes, identical on TC3xx and TC4x. */
 #define CMD_CLEAR_STATUS 0xFA
 #define CMD_ENTER_PAGE_MODE 0x50
 #define CMD_ERASE_1 0x80
@@ -50,6 +50,10 @@
 /* PFLASH page (the unit a page-mode load fills) is 32 bytes on both families. */
 #define AURIX_PAGE_SIZE 32
 
+/* Largest write burst of any supported derivative, so that a page or burst can
+ * be assembled before it is queued. */
+#define AURIX_MAX_BURST 512
+
 #define AURIX_FLASH_TIMEOUT_MS 5000
 
 struct aurix_flash_variant {
@@ -62,8 +66,23 @@ struct aurix_flash_variant {
   uint32_t status_reg;
   uint32_t error_reg;
   uint32_t error_mask;
-  /* An operation is in progress while any of these bits is set. */
+  /* Exactly one of these is used: if done_mask is non-zero the operation is
+   * complete once all of its bits are set, otherwise it is complete once no
+   * bit of busy_mask is set. */
   uint32_t busy_mask;
+  uint32_t done_mask;
+
+  /* Whether the status has to be cleared once more between filling a page and
+   * the write command. TC4x needs it because entering page mode already sets
+   * the sticky REQDONE it reports completion with; TC3xx must not have its
+   * command sequence interrupted that way and answers with a sequence error. */
+  bool clear_status_before_write;
+
+  /* How a page is filled with 32 bit accesses. TC3xx takes the two halves of
+   * the 64 bit page load register at 0x55F0 and 0x55F4; TC4x takes every word
+   * at 0x55F4. */
+  bool page_load_alternates;
+
 
   /* Length of a write burst, in bytes. */
   uint32_t burst_size;
@@ -77,6 +96,10 @@ struct aurix_flash_variant {
    * 512 KB, which is 32 of its 16 KiB logical sectors, with a sequence error.
    * 0 where only the physical sector bounds a request. */
   unsigned int max_erase_sectors;
+
+  /* Bits to force into a flash address before handing it to the command
+   * sequence interface, e.g. to reach the non-cached alias. */
+  uint32_t cmd_addr_or;
 
   /*
    * Per-sector write protection: base of PFLASH bank 0's block, the distance
@@ -115,9 +138,14 @@ static const struct aurix_flash_variant tc3xx_variant = {
      * PF0 leaves an operation on any other bank looking finished the moment it
      * is issued, and the next command then hits a busy flash. */
     .busy_mask = 0x3F << 2,
+    .done_mask = 0,
+    .page_load_alternates = true,
     .burst_size = 256,
     .sectors_per_phys_sector = 64,
     .max_erase_sectors = 32,
+    /* Unlike TC4x, the address the TC3xx command interface wants has not been
+     * established; leave it as the port had it. */
+    .cmd_addr_or = 0,
     .protect_reg = 0xF8050000, /* DMU_HP_PROCONP00 */
     .protect_bank_stride = 0x100,
     .protect_regs_per_bank = 6,
@@ -127,6 +155,29 @@ static const struct aurix_flash_variant tc3xx_variant = {
     .chipid_reg = 0xF0036140, /* SCU_CHIPID */
     .chipid_mask = 0xC0,      /* CHTEC */
     .chipid_value = 0x80,
+};
+
+/*
+ * TC4x replaces the TC3xx "HF" registers with a HOST command interface (HCI).
+ * DMU_HCI_STATUS.REQDONE (bit 31) reports completion, DMU_HCI_ERR collects the
+ * errors: ADER, SQER, PROER, ABER, CLER, PVER, EVER and OPER.
+ */
+static const struct aurix_flash_variant tc4xx_variant = {
+    .name = "tc4xx",
+    .cmd_base = 0xF8080000,
+    .status_reg = 0xF8040004, /* DMU_HCI_STATUS */
+    .error_reg = 0xF8040010,  /* DMU_HCI_ERR */
+    .error_mask = 0x000100F7,
+    .busy_mask = 0,
+    .done_mask = (1u << 31) | (1u << 30), /* REQDONE | REQACK */
+    .clear_status_before_write = true,
+    .page_load_alternates = false,
+    .burst_size = 512,
+    .sectors_per_phys_sector = 32,
+    /* The command interface rejects a cached (0x8...) flash address with a
+     * sequence error; it wants the non-cached alias, as iLLD uses. */
+    .cmd_addr_or = 0x20000000,
+    .chipid_reg = 0, /* TC4x has no SCU CHIPID; the TAS device type is used */
 };
 
 struct aurix_flash_bank {
@@ -140,12 +191,13 @@ struct aurix_flash_bank {
   unsigned int pflash_index;
 };
 
-/*
- * Start a command sequence from a known state. The error flags are sticky and
- * nothing else clears them, so without this one failed operation would make
- * every command after it fail too, reporting an error it had nothing to do
- * with.
- */
+/* Address as the command sequence interface wants to see it; a bank may be
+ * configured through a different alias than the interface accepts. */
+static inline uint32_t aurix_flash_cmd_addr(const struct aurix_flash_variant *v,
+                                            uint32_t addr) {
+  return addr | v->cmd_addr_or;
+}
+
 static int aurix_flash_clear_status(struct aurix_ocds *ocds,
                                     const struct aurix_flash_variant *v) {
   return aurix_ocds_queue_soc_write_u32(ocds, v->cmd_base | CMD_SEQ_CTRL,
@@ -183,8 +235,13 @@ static int aurix_flash_wait_done(struct aurix_ocds *ocds,
       return ERROR_FLASH_OPERATION_FAILED;
     }
 
-    if (!(status & v->busy_mask))
-      return ERROR_OK;
+    if (v->done_mask) {
+      if ((status & v->done_mask) == v->done_mask)
+        return ERROR_OK;
+    } else {
+      if (!(status & v->busy_mask))
+        return ERROR_OK;
+    }
 
     if (timeval_ms() - start > AURIX_FLASH_TIMEOUT_MS) {
       LOG_ERROR("%s: flash operation timed out, status = 0x%08" PRIx32, v->name,
@@ -273,7 +330,7 @@ static int aurix_flash_erase(struct flash_bank *bank, unsigned int first,
     if (err)
       goto err;
     err = aurix_ocds_queue_soc_write_u32(ocds, v->cmd_base | CMD_SEQ_ADDR,
-                                         addr);
+                                         aurix_flash_cmd_addr(v, addr));
     if (err)
       goto err;
     err = aurix_ocds_queue_soc_write_u32(ocds, v->cmd_base | CMD_SEQ_CNT,
@@ -309,8 +366,10 @@ err:
 static int aurix_flash_load_word(struct aurix_ocds *ocds,
                                  const struct aurix_flash_variant *v,
                                  uint32_t index, uint32_t data) {
-  /* The two halves of the 64 bit page load register take alternating words. */
-  uint32_t reg = ((index % 8) == 0) ? CMD_SEQ_DATA_L : CMD_SEQ_DATA_U;
+  uint32_t reg = CMD_SEQ_DATA_U;
+
+  if (v->page_load_alternates)
+    reg = ((index % 8) == 0) ? CMD_SEQ_DATA_L : CMD_SEQ_DATA_U;
 
   return aurix_ocds_queue_soc_write_u32(ocds, v->cmd_base | reg, data);
 }
@@ -349,33 +408,41 @@ static int aurix_flash_write(struct flash_bank *bank, const uint8_t *buffer,
                 ? v->burst_size
                 : AURIX_PAGE_SIZE;
 
-    for (i = 0; i < chunk && page_offset + i + 3 < count; i += 4) {
+    /*
+     * Assemble what goes into the page first, padding whatever the image does
+     * not cover, so that the queueing below is a plain loop either way.
+     */
+    uint8_t page[AURIX_MAX_BURST];
+    uint32_t have = MIN(chunk, count - page_offset);
+
+    memcpy(page, buffer + page_offset, have);
+    memset(page + have, 0xFF, chunk - have);
+
+    /*
+     * One request per word is what makes writing slow, but it cannot be
+     * helped: a page load targets a single address, so it is not a block
+     * transfer, and the 64 bit load iLLD uses is a CPU instruction that the
+     * debug interface cannot issue -- a 64 bit TAS write arrives as two 32 bit
+     * ones and the command sequence rejects that.
+     */
+    for (i = 0; i < chunk; i += 4) {
       uint32_t data;
-      memcpy(&data, buffer + page_offset + i, 4);
+      memcpy(&data, page + i, 4);
       err = aurix_flash_load_word(ocds, v, i, data);
       if (err)
         goto err;
     }
 
-    /* Write the trailing partial word, if any */
-    if (i < chunk && page_offset + i < count) {
-      uint32_t data = 0xFFFFFFFF;
-      memcpy(&data, buffer + page_offset + i, count - i - page_offset);
-      err = aurix_flash_load_word(ocds, v, i, data);
-      if (err)
-        goto err;
-      i += 4;
-    }
-
-    /* Fill up to the page boundary */
-    for (; i < chunk; i += 4) {
-      err = aurix_flash_load_word(ocds, v, i, 0xFFFFFFFF);
+    /* Entering page mode already set REQDONE, so clear the status once more
+     * to make it report the outcome of the write command alone. */
+    if (v->clear_status_before_write) {
+      err = aurix_flash_clear_status(ocds, v);
       if (err)
         goto err;
     }
 
     err = aurix_ocds_queue_soc_write_u32(ocds, v->cmd_base | CMD_SEQ_ADDR,
-                                         addr);
+                                         aurix_flash_cmd_addr(v, addr));
     if (err)
       goto err;
     err = aurix_ocds_queue_soc_write_u32(ocds, v->cmd_base | CMD_SEQ_CNT, 0);
@@ -530,10 +597,28 @@ FLASH_BANK_COMMAND_HANDLER(tc3xx_flash_bank_command) {
   return aurix_flash_bank_command(CMD, bank, &tc3xx_variant);
 }
 
+FLASH_BANK_COMMAND_HANDLER(tc4xx_flash_bank_command) {
+  return aurix_flash_bank_command(CMD, bank, &tc4xx_variant);
+}
+
 const struct flash_driver tc3xx_flash = {
     .name = "tc3xx",
     .usage = "<name> tc3xx <base> <size> 0 0 <target> [pflash_bank]",
     .flash_bank_command = tc3xx_flash_bank_command,
+    .probe = aurix_flash_probe,
+    .auto_probe = aurix_flash_auto_probe,
+    .erase = aurix_flash_erase,
+    .protect_check = aurix_flash_protect_check,
+    .write = aurix_flash_write,
+    .read = aurix_flash_read,
+    .info = aurix_flash_info,
+    .free_driver_priv = default_flash_free_driver_priv,
+};
+
+const struct flash_driver tc4xx_flash = {
+    .name = "tc4xx",
+    .usage = "<name> tc4xx <base> <size> 0 0 <target>",
+    .flash_bank_command = tc4xx_flash_bank_command,
     .probe = aurix_flash_probe,
     .auto_probe = aurix_flash_auto_probe,
     .erase = aurix_flash_erase,

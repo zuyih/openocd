@@ -29,6 +29,7 @@
 #define CSFR_TR_EVT(n) (0xF000 + (n) * 8)
 #define CSFR_TR_ADR(n) (0xF004 + (n) * 8)
 #define CSFR_DBGSR 0xFD00
+#define CSFR_DBGACT 0xFD14
 #define CSFR_TRIG_ACC 0xFD30
 #define CSFR_PC 0xFE08
 #define CSFR_SYSCON 0xFE14
@@ -53,13 +54,17 @@
 /*
  * What a trigger does when it matches. TriCore 1.6.2 keeps that in the event
  * register itself: EVTA 010 halts, and BOD suppresses the BRKOUT pulse that
- * would otherwise come with it.
+ * would otherwise come with it. TriCore 1.8 moved the action to the shared
+ * DBGACT and left bit 0 of the event register as a plain enable, so the two
+ * families arm a trigger with different bits but agree on everything else.
  */
 #define TREVT_EVTA_HALT 0x2
 #define TREVT_BOD (1 << 4)
+#define TREVT_EN (1 << 0)
 
-/* Bits that arm a trigger so that a match halts the core. */
-#define TREVT_ARM (TREVT_BOD | TREVT_EVTA_HALT)
+/* Action a debug event takes: halt, without pulsing BRKOUT. */
+#define DBGACT_EVTA_HALT 0x2
+#define DBGACT_BOD (1 << 3)
 
 /* Triggers per core; the last one is kept for single stepping. */
 #define AURIX_NUM_TRIGGERS 8
@@ -163,6 +168,14 @@ static int aurix_write_trigger(struct target *target, unsigned int n,
 
   return target_write_u32(
       target, aurix_ocds_csfr(ocds, target->coreid, CSFR_TR_EVT(n)), evt);
+}
+
+/** Bits that arm a trigger so that a match halts the core. */
+static uint32_t aurix_trigger_arm(struct target *target) {
+  if (target_to_aurix(target)->ocds->device->has_dbgact)
+    return TREVT_EN;
+
+  return TREVT_BOD | TREVT_EVTA_HALT;
 }
 
 /*
@@ -423,7 +436,7 @@ int aurix_step(struct target *target, bool current, target_addr_t address,
    * destination and instruction length does not have to be known.
    */
   ret = aurix_write_trigger(target, AURIX_STEP_TRIGGER, pc,
-                            TREVT_ARM | TREVT_TYP);
+                            aurix_trigger_arm(target) | TREVT_TYP);
   if (ret != ERROR_OK)
     goto restore;
 
@@ -465,7 +478,7 @@ out:
 restore:
   if (stepped_over)
     aurix_write_trigger(target, stepped_over->number, stepped_over->address,
-                        TREVT_ARM | TREVT_BBM | TREVT_TYP);
+                        aurix_trigger_arm(target) | TREVT_BBM | TREVT_TYP);
 
   return ret;
 }
@@ -727,7 +740,7 @@ int aurix_add_breakpoint(struct target *target, struct breakpoint *breakpoint) {
   }
 
   ret = aurix_write_trigger(target, n, breakpoint->address,
-                            TREVT_ARM | TREVT_BBM | TREVT_TYP);
+                            aurix_trigger_arm(target) | TREVT_BBM | TREVT_TYP);
   if (ret != ERROR_OK)
     return ret;
 
@@ -797,7 +810,7 @@ int aurix_add_watchpoint(struct target *target, struct watchpoint *watchpoint) {
     return ERROR_NOT_IMPLEMENTED;
   }
 
-  evt = TREVT_ARM;
+  evt = aurix_trigger_arm(target);
   if (watchpoint->rw == WPT_READ || watchpoint->rw == WPT_ACCESS)
     evt |= TREVT_ALD;
   if (watchpoint->rw == WPT_WRITE || watchpoint->rw == WPT_ACCESS)
@@ -1021,6 +1034,18 @@ int aurix_examine(struct target *target) {
   }
   target_to_aurix(target)->trigger_used = 0;
   target_to_aurix(target)->trigger_is_watchpoint = 0;
+
+  /* On TriCore 1.8 the action every debug event takes is shared; 1.6.2
+   * carries it per event register instead, see aurix_trigger_arm(). */
+  if (target_to_aurix(target)->ocds->device->has_dbgact) {
+    ret = target_write_u32(
+        target, aurix_ocds_csfr(ocds, target->coreid, CSFR_DBGACT),
+        DBGACT_BOD | DBGACT_EVTA_HALT);
+    if (ret != ERROR_OK) {
+      LOG_TARGET_ERROR(target, "Failed to set the debug event action");
+      return ret;
+    }
+  }
 
   return ERROR_OK;
 }
