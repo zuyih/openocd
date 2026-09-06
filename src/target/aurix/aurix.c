@@ -29,12 +29,16 @@
 #define CSFR_TR_EVT(n) (0xF000 + (n) * 8)
 #define CSFR_TR_ADR(n) (0xF004 + (n) * 8)
 #define CSFR_DBGSR 0xFD00
+#define CSFR_DBGACT 0xFD14
 #define CSFR_TRIG_ACC 0xFD30
 #define CSFR_PC 0xFE08
 #define CSFR_SYSCON 0xFE14
+#define CSFR_BOOTCON 0xFE60
 
-/* Set while a core waits in boot halt; it starts once software clears it. */
+/* Set while a core waits in boot halt; it starts once software clears it.
+ * TriCore 1.6.x keeps it in SYSCON, 1.8 in BOOTCON. */
 #define SYSCON_BHALT (1 << 24)
+#define BOOTCON_BHALT (1 << 0)
 
 #define DBGSR_HALT (1 << 1)
 #define DBGSR_HALT_SET (3 << 1)
@@ -53,13 +57,17 @@
 /*
  * What a trigger does when it matches. TriCore 1.6.2 keeps that in the event
  * register itself: EVTA 010 halts, and BOD suppresses the BRKOUT pulse that
- * would otherwise come with it.
+ * would otherwise come with it. TriCore 1.8 moved the action to the shared
+ * DBGACT and left bit 0 of the event register as a plain enable, so the two
+ * families arm a trigger with different bits but agree on everything else.
  */
 #define TREVT_EVTA_HALT 0x2
 #define TREVT_BOD (1 << 4)
+#define TREVT_EN (1 << 0)
 
-/* Bits that arm a trigger so that a match halts the core. */
-#define TREVT_ARM (TREVT_BOD | TREVT_EVTA_HALT)
+/* Action a debug event takes: halt, without pulsing BRKOUT. */
+#define DBGACT_EVTA_HALT 0x2
+#define DBGACT_BOD (1 << 3)
 
 /* Triggers per core; the last one is kept for single stepping. */
 #define AURIX_NUM_TRIGGERS 8
@@ -133,12 +141,27 @@ static int aurix_read_dbgsr(struct target *target, uint32_t *debug_sr) {
       debug_sr);
 }
 
-static int aurix_read_syscon(struct target *target, uint32_t *syscon) {
+/*
+ * Whether a core still waits in boot halt. On TriCore 1.8, which is what
+ * has_dbgact marks, the SYSCON offset holds CORECON, whose bits 31:18 are
+ * reserved, and the flag moved to BOOTCON.
+ */
+static int aurix_read_boot_halt(struct target *target, bool *bhalt) {
   struct aurix_private_config *aurix = target_to_aurix(target);
+  bool tc18 = aurix->ocds->device->has_dbgact;
+  uint32_t value;
+  int ret;
 
-  return aurix_ocds_atomic_read_u32(
-      aurix->ocds, aurix_ocds_csfr(aurix->ocds, target->coreid, CSFR_SYSCON),
-      syscon);
+  ret = aurix_ocds_atomic_read_u32(
+      aurix->ocds,
+      aurix_ocds_csfr(aurix->ocds, target->coreid,
+                      tc18 ? CSFR_BOOTCON : CSFR_SYSCON),
+      &value);
+  if (ret != ERROR_OK)
+    return ret;
+
+  *bhalt = value & (tc18 ? BOOTCON_BHALT : SYSCON_BHALT);
+  return ERROR_OK;
 }
 
 static int tricore_breakpoints_clear(struct target *target) {
@@ -165,6 +188,14 @@ static int aurix_write_trigger(struct target *target, unsigned int n,
       target, aurix_ocds_csfr(ocds, target->coreid, CSFR_TR_EVT(n)), evt);
 }
 
+/** Bits that arm a trigger so that a match halts the core. */
+static uint32_t aurix_trigger_arm(struct target *target) {
+  if (target_to_aurix(target)->ocds->device->has_dbgact)
+    return TREVT_EN;
+
+  return TREVT_BOD | TREVT_EVTA_HALT;
+}
+
 /*
  * Refuse to run a core that is still in boot halt. Releasing it is a decision
  * about the system, not about debugging: the application chose not to start
@@ -172,17 +203,17 @@ static int aurix_write_trigger(struct target *target, unsigned int n,
  * halt behind the user's back would run it from whatever the boot PC holds.
  */
 static int aurix_check_boot_halt(struct target *target) {
-  uint32_t syscon;
+  bool bhalt;
   int ret;
 
-  ret = aurix_read_syscon(target, &syscon);
+  ret = aurix_read_boot_halt(target, &bhalt);
   if (ret != ERROR_OK)
     return ret;
 
-  if (syscon & SYSCON_BHALT) {
+  if (bhalt) {
     LOG_TARGET_ERROR(target,
                      "core is in boot halt and has not been started; it runs "
-                     "once software clears its SYSCON.BHALT");
+                     "once software clears its BHALT");
     return ERROR_TARGET_NOT_HALTED;
   }
 
@@ -193,22 +224,20 @@ static int aurix_poll(struct target *target) {
   enum target_state prev_target_state;
   int ret = ERROR_OK;
   uint32_t dbgsr;
-  uint32_t syscon;
+  bool bhalt;
 
   ret = aurix_read_dbgsr(target, &dbgsr);
   if (ret != ERROR_OK)
     return ret;
 
-  ret = aurix_read_syscon(target, &syscon);
+  ret = aurix_read_boot_halt(target, &bhalt);
   if (ret != ERROR_OK)
     return ret;
 
   /* A core other than 0 comes out of reset in boot halt and stays there until
-   * software clears SYSCON.BHALT, so on a device whose application never
-   * starts it, it is stopped without the debug unit having stopped it. On TC4x
-   * this offset is CORECON, whose bits 31:18 are reserved, so it reads back
-   * zero and the test never fires there. */
-  if (syscon & SYSCON_BHALT) {
+   * software clears BHALT, so on a device whose application never starts it,
+   * it is stopped without the debug unit having stopped it. */
+  if (bhalt) {
     target->state = TARGET_HALTED;
     return ERROR_OK;
   }
@@ -423,7 +452,7 @@ int aurix_step(struct target *target, bool current, target_addr_t address,
    * destination and instruction length does not have to be known.
    */
   ret = aurix_write_trigger(target, AURIX_STEP_TRIGGER, pc,
-                            TREVT_ARM | TREVT_TYP);
+                            aurix_trigger_arm(target) | TREVT_TYP);
   if (ret != ERROR_OK)
     goto restore;
 
@@ -465,7 +494,7 @@ out:
 restore:
   if (stepped_over)
     aurix_write_trigger(target, stepped_over->number, stepped_over->address,
-                        TREVT_ARM | TREVT_BBM | TREVT_TYP);
+                        aurix_trigger_arm(target) | TREVT_BBM | TREVT_TYP);
 
   return ret;
 }
@@ -573,12 +602,12 @@ int aurix_deassert_reset(struct target *target) {
      * halt" wants; for "reset run" let the core go. That halt is a trigger on
      * the reset vector, which would stop the core again at once, so clear it
      * first. A core in boot halt stays there, as it would after any reset. */
-    uint32_t syscon;
+    bool bhalt;
 
-    ret = aurix_read_syscon(target, &syscon);
+    ret = aurix_read_boot_halt(target, &bhalt);
     if (ret != ERROR_OK)
       return ret;
-    if (!(syscon & SYSCON_BHALT)) {
+    if (!bhalt) {
       ret = tricore_breakpoints_clear(target);
       if (ret != ERROR_OK)
         return ret;
@@ -743,7 +772,7 @@ int aurix_add_breakpoint(struct target *target, struct breakpoint *breakpoint) {
   }
 
   ret = aurix_write_trigger(target, n, breakpoint->address,
-                            TREVT_ARM | TREVT_BBM | TREVT_TYP);
+                            aurix_trigger_arm(target) | TREVT_BBM | TREVT_TYP);
   if (ret != ERROR_OK)
     return ret;
 
@@ -813,7 +842,7 @@ int aurix_add_watchpoint(struct target *target, struct watchpoint *watchpoint) {
     return ERROR_NOT_IMPLEMENTED;
   }
 
-  evt = TREVT_ARM;
+  evt = aurix_trigger_arm(target);
   if (watchpoint->rw == WPT_READ || watchpoint->rw == WPT_ACCESS)
     evt |= TREVT_ALD;
   if (watchpoint->rw == WPT_WRITE || watchpoint->rw == WPT_ACCESS)
@@ -1037,6 +1066,18 @@ int aurix_examine(struct target *target) {
   }
   target_to_aurix(target)->trigger_used = 0;
   target_to_aurix(target)->trigger_is_watchpoint = 0;
+
+  /* On TriCore 1.8 the action every debug event takes is shared; 1.6.2
+   * carries it per event register instead, see aurix_trigger_arm(). */
+  if (target_to_aurix(target)->ocds->device->has_dbgact) {
+    ret = target_write_u32(
+        target, aurix_ocds_csfr(ocds, target->coreid, CSFR_DBGACT),
+        DBGACT_BOD | DBGACT_EVTA_HALT);
+    if (ret != ERROR_OK) {
+      LOG_TARGET_ERROR(target, "Failed to set the debug event action");
+      return ret;
+    }
+  }
 
   return ERROR_OK;
 }
