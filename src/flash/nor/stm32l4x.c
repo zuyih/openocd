@@ -428,6 +428,10 @@ static const struct stm32l4_rev stm32wle_wl5xx_revs[] = {
 	{ 0x1000, "1.0" },
 };
 
+static const struct stm32l4_rev stm32u35_u36xx_revs[] = {
+	{ 0x1001, "Z" },
+};
+
 static const struct stm32l4_part_info stm32l4_parts[] = {
 	{
 	  .id                    = DEVID_STM32L47_L48XX,
@@ -854,6 +858,18 @@ static const struct stm32l4_part_info stm32l4_parts[] = {
 	  .fsize_addr            = 0x1FFF75E0,
 	  .otp_base              = 0x1FFF7000,
 	  .otp_size              = 1024,
+	},
+	{
+	  .id                    = DEVID_STM32U35_U36XX,
+	  .revs                  = stm32u35_u36xx_revs,
+	  .num_revs              = ARRAY_SIZE(stm32u35_u36xx_revs),
+	  .device_str            = "STM32U35/U36xx",
+	  .max_flash_size_kb     = 512,
+	  .flags                 = F_HAS_DUAL_BANK | F_HAS_TZ | F_HAS_L5_FLASH_REGS | F_WRP_HAS_LOCK,
+	  .flash_regs_base       = 0x40022000,
+	  .fsize_addr            = 0x0BFA07A0,
+	  .otp_base              = 0x0BFA0000,
+	  .otp_size              = 512,
 	},
 };
 
@@ -2290,6 +2306,7 @@ static int stm32l4_probe(struct flash_bank *bank)
 		break;
 	case DEVID_STM32U3B_U3CXX:
 	case DEVID_STM32U37_U38XX:
+	case DEVID_STM32U35_U36XX:
 		page_size_kb = 4;
 		num_pages = flash_size_kb / page_size_kb;
 		stm32l4_info->bank1_sectors = num_pages;
