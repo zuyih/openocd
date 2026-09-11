@@ -22,6 +22,7 @@ NOR_DRIVERS = \
 	%D%/ath79.c \
 	%D%/atsamv.c \
 	%D%/atsame5.c \
+	%D%/aurix_eflash.c \
 	%D%/avrf.c \
 	%D%/bl602.c \
 	%D%/bluenrg-x.c \
