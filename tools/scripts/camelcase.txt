@@ -180,6 +180,7 @@ WSASetLastError
 WSAStartup
 dwPlatformId
 dwOSVersionInfoSize
+GetUserNameA
 
 # OpenOCD exceptions that should be removed
 KiB

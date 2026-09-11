@@ -420,6 +420,7 @@ extern struct adapter_driver rlink_adapter_driver;
 extern struct adapter_driver rshim_dap_adapter_driver;
 extern struct adapter_driver stlink_dap_adapter_driver;
 extern struct adapter_driver sysfsgpio_adapter_driver;
+extern struct adapter_driver tas_client_adapter_driver;
 extern struct adapter_driver ulink_adapter_driver;
 extern struct adapter_driver usb_blaster_adapter_driver;
 extern struct adapter_driver usbprog_adapter_driver;
