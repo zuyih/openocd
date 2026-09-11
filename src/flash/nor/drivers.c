@@ -99,6 +99,7 @@ static const struct flash_driver * const flash_drivers[] = {
 	&tc2x_eflash,
 	&tc3x_eflash,
 	&tc4x_eflash,
+	&tc4x_rram,
 	&tms470_flash,
 	&virtual_flash,
 	&w600_flash,
