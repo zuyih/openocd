@@ -110,8 +110,10 @@ static struct target_type *target_types[] = {
 	&riscv_target,
 	&stm8_target,
 	&testee_target,
+	&tricore_target,
 	&xscale_target,
 	&xtensa_chip_target,
+	NULL,
 };
 
 struct target *all_targets;
