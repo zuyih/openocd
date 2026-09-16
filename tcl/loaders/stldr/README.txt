@@ -24,3 +24,23 @@ ART-Pi2_ST_winbond_64MB.stldr
 	not as something this project can relicense or claim. Anything that
 	cares about the licensing of what it ships should drop the file and
 	name its own through EXTERNAL_LOADER.
+
+
+MX25UM25645G_ATK-CNN647B_ExtMemLoader.stldr
+	The MX25UM25645G octal NOR flash on the XSPI of the ALIENTEK
+	ATK-CNN647B, an STM32N647X0 core board, 32 MB at 0x70000000. Used by
+	board/atk_cnn647b.cfg. An STM32N6 has no internal flash, so this is
+	the only thing to program on it.
+
+	Taken unmodified from the board's software package, at
+	External_Loader/MX25UM25645G_ATK-CNN647B/Binary/.
+
+	sha256 0bce846a1f25e4e967d572efb5a3f97f8a839817b53bf60d837aadfee740dcb5
+
+	A prebuilt binary again, but this one the package does carry the
+	sources of, next to it, as an STM32CubeIDE project. They say
+	"Copyright (c) 2023 STMicroelectronics" and refer to a LICENSE file
+	that the package does not come with, which by their own wording
+	leaves them as-is. Same caveat as above: here for convenience, not
+	something this project can relicense, and replaceable through
+	FLASH_LOADERS.
