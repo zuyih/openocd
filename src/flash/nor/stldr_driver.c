@@ -106,6 +106,8 @@ struct stldr_loader {
 	uint32_t return_addr;
 	uint32_t offset;
 	uint32_t size;
+	/* Address of the section the loader functions live in. */
+	uint32_t code_addr;
 	uint32_t func_addr[FUNC_ID_COUNT];
 	struct list_head sections;
 	struct working_area *work_area;
@@ -123,6 +125,26 @@ enum stldr_type {
 	STLDR_TYPE_SDRAM,
 	STLDR_TYPE_I2C_EEPROM
 };
+
+/* Whether a device of this type has anything to erase before it is written.
+ * RAM has not, and neither has an EEPROM, which is written a byte at a time,
+ * so a loader for one carries no SectorErase and is not the poorer for it.
+ * A type that is not named here is taken to erase, so that a loader for some
+ * kind of flash this does not know about is still held to having one.
+ */
+static bool stldr_type_erases(enum stldr_type type)
+{
+	switch (type) {
+	case STLDR_TYPE_SRAM:
+	case STLDR_TYPE_PSRAM:
+	case STLDR_TYPE_SDRAM:
+	case STLDR_TYPE_PC_CARD:
+	case STLDR_TYPE_I2C_EEPROM:
+		return false;
+	default:
+		return true;
+	}
+}
 
 struct stldr_dev_sector {
 	uint32_t count;
@@ -286,13 +308,22 @@ static int stldr_parse(struct flash_bank *bank, const char *stldr_path)
 		section->size = section_header.sh_size;
 		section->content = content;
 		section->idx = idx;
-		/* sh_flags already checked against SHF_ALLOC */
-		section->do_write = (section_header.sh_flags & (SHF_EXECINSTR)) == (SHF_EXECINSTR);
+		/* sh_flags already checked against SHF_ALLOC, so what is left to ask
+		 * is whether there is anything to load. Carrying only the executable
+		 * sections is enough for a loader whose data sits in one of them, as
+		 * the ST template arranges, but not for one built the ordinary way:
+		 * a GCC linked loader keeps its initialised data in .data, and left
+		 * behind it reads whatever the RAM held. .bss and friends are
+		 * SHT_NOBITS and only name an extent, and the file bytes that happen
+		 * to lie at their offset are not their contents, so they stay out.
+		 */
+		section->do_write = section_header.sh_type != SHT_NOBITS;
 
 		list_add_tail(&section->lh, &stldr_info->loader.sections);
 
 		/* check if the flash loader is relocatable */
-		if ((section->addr & 0xFF000000) == 0 && section->do_write)
+		if ((section->addr & 0xFF000000) == 0
+				&& (section_header.sh_flags & SHF_EXECINSTR))
 			stldr_info->loader.relocatable = true;
 
 		LOG_DEBUG("Loader Section found { addr : 0x%08X , size : 0x%08X }",
@@ -336,6 +367,9 @@ static int stldr_parse(struct flash_bank *bank, const char *stldr_path)
 	for (int f = 0; f < FUNC_ID_COUNT; f++)
 		stldr_info->loader.func_addr[stldr_functions[f].id] = STLDR_FUNC_ADDR_UNKNOWN;
 
+	/* Which section the loader functions live in. SHN_UNDEF until one is seen. */
+	unsigned int code_shndx = 0;
+
 	const unsigned int symbol_count = symtab_sh.sh_size / symtab_sh.sh_entsize;
 	for (unsigned int j = 0; j < symbol_count; j++) {
 		Elf32_Sym symbol;
@@ -377,6 +411,7 @@ static int stldr_parse(struct flash_bank *bank, const char *stldr_path)
 			if (strcmp(stldr_functions[f].name, symbol_name) == 0) {
 				LOG_DEBUG("Loader Function '%s' found at 0x%08X", symbol_name, symbol.st_value);
 				stldr_info->loader.func_addr[stldr_functions[f].id] = symbol.st_value;
+				code_shndx = symbol.st_shndx;
 				break;
 			}
 		}
@@ -388,31 +423,49 @@ static int stldr_parse(struct flash_bank *bank, const char *stldr_path)
 	for (int f = 0; f < FUNC_ID_COUNT; f++) {
 		if (stldr_functions[f].type == STLDR_FUNC_OPTIONAL)
 			continue;
+		/* SectorErase is only mandatory where there is something to erase. */
+		if (stldr_functions[f].id == FUNC_ID_SECTOR_ERASE
+				&& !stldr_type_erases(stldr_info->dev_info.type))
+			continue;
 		if (stldr_info->loader.func_addr[stldr_functions[f].id] == STLDR_FUNC_ADDR_UNKNOWN) {
 			LOG_ERROR("Loader function %s not found", stldr_functions[f].name);
 			return ERROR_FAIL;
 		}
 	}
 
-	/* Compute loader size */
+	/* Take the extent of everything that will be loaded, and note which section
+	 * the functions are in. A loader is not necessarily one section: the ST
+	 * template keeps the device description in a section of its own and marks
+	 * it executable, which is what carries it to the target, so the address to
+	 * enter the loader at has to be the one the functions are at rather than
+	 * whichever section happens to come last. */
 	struct stldr_section *section;
-	uint32_t last_section_addr = 0;
-	uint32_t count_do_write = 0;
+	uint32_t lowest = UINT32_MAX;
+	uint32_t highest = 0;
 	list_for_each_entry(section, &stldr_info->loader.sections, lh) {
+		if (section->idx == code_shndx)
+			stldr_info->loader.code_addr = section->addr;
+
 		if (!section->do_write)
 			continue;
 
-		count_do_write++;
-		if (section->addr >= last_section_addr) {
-			last_section_addr = section->addr;
-			stldr_info->loader.size += section->size;
-		}
+		if (section->addr < lowest)
+			lowest = section->addr;
+		if (section->addr + section->size > highest)
+			highest = section->addr + section->size;
 	}
 
-	if (count_do_write > 1) {
-		LOG_ERROR("FlashLoader contain multiple execute sections");
+	if (highest == 0) {
+		LOG_ERROR("FlashLoader has nothing to load");
 		return ERROR_FAIL;
 	}
+
+	/* A loader whose functions are not in a section that gets loaded leaves
+	 * nothing to enter at; fall back to the start of what was loaded. */
+	if (!stldr_info->loader.code_addr)
+		stldr_info->loader.code_addr = lowest;
+
+	stldr_info->loader.size = highest - lowest;
 
 	stldr_info->loader.parsed = true;
 
@@ -493,6 +546,27 @@ static int stldr_write_loader(struct flash_bank *bank)
 		stldr_info->loader.return_addr = stldr_info->loader.work_area->address;
 		stldr_info->loader.offset = stldr_info->loader.work_area->address + 4;
 		LOG_INFO("loader offset 0x%08X", stldr_info->loader.offset);
+	} else {
+		/* The exit point has to be a word the loader will not write over,
+		 * because armv7m_run_algorithm stops the core with a software
+		 * breakpoint there, and a software breakpoint is an instruction in
+		 * memory like any other. The four bytes below the code are not that
+		 * word: what is there is whatever the link left, and for a loader
+		 * built with GCC it is the tail of .bss, which Init clears before
+		 * doing anything else. The breakpoint goes with it, so when Init
+		 * returns there is nothing to stop the core, and it runs into the
+		 * zeroes until it double faults. Take the word from the working
+		 * area, which the loader is already required not to overlap.
+		 */
+		if (target_alloc_working_area(target, 4,
+				&stldr_info->loader.work_area) != ERROR_OK) {
+			LOG_ERROR("no working area for the loader's exit point");
+			return ERROR_TARGET_RESOURCE_NOT_AVAILABLE;
+		}
+
+		stldr_info->loader.return_addr = stldr_info->loader.work_area->address;
+		stldr_info->loader.offset = stldr_info->loader.code_addr;
+		LOG_INFO("loader offset 0x%08X", stldr_info->loader.offset);
 	}
 
 	list_for_each_entry(section, &stldr_info->loader.sections, lh) {
@@ -510,11 +584,6 @@ static int stldr_write_loader(struct flash_bank *bank)
 			int retval = target_write_memory(target, section->addr, 4, section->size / 4, section->content);
 			if (retval != ERROR_OK)
 				return retval;
-
-			/* update loader functions offset */
-			stldr_info->loader.return_addr = section->addr - 4;
-			stldr_info->loader.offset = section->addr;
-			LOG_INFO("loader offset 0x%08X", stldr_info->loader.offset);
 		} else {
 			int retval = target_write_buffer(target, section->addr + stldr_info->loader.offset,
 							section->size, section->content);
@@ -695,6 +764,17 @@ static int stldr_exec_function_write(struct flash_bank *bank,
 static int stldr_erase(struct flash_bank *bank, unsigned int first,
 		unsigned int last)
 {
+	struct stldr_flash_bank *stldr_info = bank->driver_priv;
+
+	/* A device that does not erase is simply written over. The flash core
+	 * asks all the same, since writing an image erases first, so answer
+	 * that it is done rather than fail over a function that is rightly
+	 * absent. */
+	if (stldr_info->loader.func_addr[FUNC_ID_SECTOR_ERASE] == STLDR_FUNC_ADDR_UNKNOWN) {
+		LOG_DEBUG("device does not erase, nothing to do");
+		return ERROR_OK;
+	}
+
 	int retval = stldr_exec_function_init(bank);
 	if (retval != ERROR_OK) {
 		stldr_exec_function_deinit(bank);
@@ -1006,6 +1086,13 @@ COMMAND_HANDLER(stldr_handle_init_command)
 		command_print(CMD, "stldr init complete");
 	else
 		command_print(CMD, "stldr init failed");
+
+	/* Every other way into the loader gives the working area back when it is
+	 * done with it, and this one has to as well: what it holds is the word
+	 * the loader returns to, which is of no use once nothing is running. Left
+	 * behind, it is still there to be restored at shutdown, by which time the
+	 * access port it would be restored through is going away. */
+	stldr_exec_function_deinit(bank);
 
 	return retval;
 }
