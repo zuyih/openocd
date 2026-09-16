@@ -1050,6 +1050,52 @@ exit_error:
 	return ERROR_FLASH_OPERATION_FAILED;
 }
 
+/* Read the bank the way everything that is not the loader reads it: through
+ * the address the loader maps it at.
+ *
+ * Which means the loader has to have mapped it, and the flash core will not
+ * have seen to that -- it calls these when it is asked to, out of whatever
+ * state the target is in. On a part whose flash is only there through an
+ * external memory controller that is not a detail. A read the bus does not
+ * answer is not an error that comes back to be handled: it faults the access
+ * port, and every access to the core after it fails until the board has been
+ * powered off and on again. "flash erase_check" on a bank that had not been
+ * touched since reset was one command away from that.
+ *
+ * So run Init and let the default implementation have its addresses. It is
+ * what stldr_read already does for the same reason.
+ */
+static int stldr_erase_check(struct flash_bank *bank)
+{
+	int retval = stldr_exec_function_init(bank);
+	if (retval != ERROR_OK) {
+		stldr_exec_function_deinit(bank);
+		return retval;
+	}
+
+	retval = default_flash_blank_check(bank);
+
+	stldr_exec_function_deinit(bank);
+
+	return retval;
+}
+
+static int stldr_verify(struct flash_bank *bank, const uint8_t *buffer,
+		uint32_t offset, uint32_t count)
+{
+	int retval = stldr_exec_function_init(bank);
+	if (retval != ERROR_OK) {
+		stldr_exec_function_deinit(bank);
+		return retval;
+	}
+
+	retval = default_flash_verify(bank, buffer, offset, count);
+
+	stldr_exec_function_deinit(bank);
+
+	return retval;
+}
+
 static int stldr_probe(struct flash_bank *bank)
 {
 	struct stldr_flash_bank *stldr_info = bank->driver_priv;
@@ -1310,9 +1356,10 @@ const struct flash_driver stldr_flash = {
 		.protect = stldr_protect,
 		.write = stldr_write,
 		.read = stldr_read,
+		.verify = stldr_verify,
 		.probe = stldr_probe,
 		.auto_probe = stldr_auto_probe,
-		.erase_check = default_flash_blank_check,
+		.erase_check = stldr_erase_check,
 		.protect_check = stldr_protect_check,
 		.info = stldr_get_info,
 		.free_driver_priv = stldr_free_driver_priv
