@@ -700,6 +700,31 @@ static int stldr_exec_function_init(struct flash_bank *bank)
 	return ERROR_OK;
 }
 
+/* Leave the memory reachable the way Init left it.
+ *
+ * A loader for an external memory finishes Init with the controller mapping
+ * that memory into the address space, which is the only reason a read that
+ * does not go through the loader works: stldr_read runs Init for exactly that
+ * and then lets default_flash_read take the plain bus. Write and SectorErase
+ * leave the controller driving the bus by hand instead, so whatever reads the
+ * flash next faults on it -- the verify_image that "program ... verify" ends
+ * with, among others, which never passes through this driver at all.
+ *
+ * So run Init once more when an operation is done. The loader is still
+ * resident by then, so this is only the call.
+ */
+static int stldr_remap(struct flash_bank *bank)
+{
+	struct stldr_func_args args;
+	stldr_func_args_init(&args);
+
+	int retval = stldr_exec_function(bank, FUNC_ID_INIT, STLDR_INIT_TIMEOUT, &args);
+	if (retval != ERROR_OK || args.ret != STLDR_FUNC_SUCCESS)
+		return ERROR_FLASH_OPERATION_FAILED;
+
+	return ERROR_OK;
+}
+
 static int stldr_exec_function_mass_erase(struct flash_bank *bank)
 {
 	struct stldr_flash_bank *stldr_info = bank->driver_priv;
@@ -720,6 +745,12 @@ static int stldr_exec_function_mass_erase(struct flash_bank *bank)
 	if (retval != ERROR_OK || args.ret != STLDR_FUNC_SUCCESS) {
 		stldr_exec_function_deinit(bank);
 		return ERROR_FLASH_OPERATION_FAILED;
+	}
+
+	retval = stldr_remap(bank);
+	if (retval != ERROR_OK) {
+		stldr_exec_function_deinit(bank);
+		return retval;
 	}
 
 	return stldr_exec_function_deinit(bank);
@@ -784,6 +815,8 @@ static int stldr_erase(struct flash_bank *bank, unsigned int first,
 	retval = stldr_exec_function_sector_erase(bank,
 			bank->base + bank->sectors[first].offset,
 			bank->base + bank->sectors[last].offset);
+	if (retval == ERROR_OK)
+		retval = stldr_remap(bank);
 	stldr_exec_function_deinit(bank);
 	if (retval != ERROR_OK)
 		return retval;
@@ -858,6 +891,11 @@ static int stldr_write(struct flash_bank *bank, const uint8_t *buffer,
 		address += buffer_size;
 		count -= buffer_size;
 	}
+
+	retval = stldr_remap(bank);
+	if (retval != ERROR_OK)
+		goto exit_error;
+
 	stldr_exec_function_deinit(bank);
 	target_free_working_area(bank->target, source);
 	return ERROR_OK;
