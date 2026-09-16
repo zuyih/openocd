@@ -1092,7 +1092,8 @@ static int stldr_probe(struct flash_bank *bank)
 		}
 	}
 
-	LOG_DEBUG("Bank (%u) size is %" PRIu32 " kb, base address is " TARGET_ADDR_FMT,
+	LOG_INFO("Device: %s", dev_info->name);
+	LOG_INFO("Bank (%u) size is %" PRIu32 " kb, base address is " TARGET_ADDR_FMT,
 			bank->bank_number, bank->size >> 10, bank->base);
 
 	stldr_info->probed = true;
