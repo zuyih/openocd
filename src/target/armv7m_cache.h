@@ -13,6 +13,7 @@
 
 #include <helper/types.h>
 
+struct command_invocation;
 struct target;
 
 struct armv7m_cache_size {

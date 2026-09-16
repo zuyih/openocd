@@ -17,6 +17,7 @@
 
 #include <helper/binarybuffer.h>
 #include <target/algorithm.h>
+#include <target/armv7m_cache.h>
 #include <target/breakpoints.h>
 #include <target/cortex_m.h>
 #include <sys/stat.h>
@@ -526,6 +527,64 @@ static void stldr_free_driver_priv(struct flash_bank *bank)
 	bank->driver_priv = NULL;
 }
 
+/* Where a section of the loader is put: a relocatable one goes wherever its
+ * working area is, an absolute one at the address it was linked for.
+ */
+static uint32_t stldr_section_addr(const struct stldr_loader *loader,
+		const struct stldr_section *section)
+{
+	return section->addr + (loader->relocatable ? loader->offset : 0);
+}
+
+/* Take the core's caches out of the way of what the debugger is about to write.
+ *
+ * A loader is free to turn the caches on, and the ones from CubeProgrammer do
+ * it in Init, with nothing turning them off again. What the loader reads then
+ * stays in the data cache, while a write from the debugger goes straight to
+ * memory, so the core keeps seeing what was there before. Reading the memory
+ * back does not show it, because that goes through the debug access port,
+ * which sees memory and agrees.
+ *
+ * Clean and invalidate, so that what the loader dirtied is written out and the
+ * write that follows has nothing left to shadow it. Doing it the other way
+ * round, after the write, would be worse than not doing it at all: cleaning a
+ * line the debugger has already written past puts the stale copy back.
+ *
+ * CCR is asked each time rather than remembered. It costs one word, and a
+ * loader that leaves the caches alone -- the ART-Pi2's does -- then pays
+ * nothing at all, as does every Cortex-M that has no caches to enable.
+ */
+static int stldr_flush_code(struct target *target, uint32_t ccr,
+		uint32_t addr, uint32_t size)
+{
+	if (ccr & CCR_DC_MASK) {
+		int retval = armv7m_d_cache_flush(target, addr, size);
+		if (retval != ERROR_OK)
+			return retval;
+	}
+
+	if (ccr & CCR_IC_MASK)
+		return armv7m_i_cache_inval(target, addr, size);
+
+	return ERROR_OK;
+}
+
+/* The same for a block of data, which the core reads but never executes, and
+ * which the caller has the extent of rather than having to be told.
+ */
+static int stldr_flush_data(struct target *target, uint32_t addr, uint32_t size)
+{
+	uint32_t ccr;
+	int retval = target_read_u32(target, CCR, &ccr);
+	if (retval != ERROR_OK)
+		return retval;
+
+	if (!(ccr & CCR_DC_MASK))
+		return ERROR_OK;
+
+	return armv7m_d_cache_flush(target, addr, size);
+}
+
 static int stldr_write_loader(struct flash_bank *bank)
 {
 	struct stldr_flash_bank *stldr_info = bank->driver_priv;
@@ -569,9 +628,20 @@ static int stldr_write_loader(struct flash_bank *bank)
 		LOG_INFO("loader offset 0x%08X", stldr_info->loader.offset);
 	}
 
+	uint32_t ccr;
+	int retval = target_read_u32(target, CCR, &ccr);
+	if (retval != ERROR_OK)
+		return retval;
+
 	list_for_each_entry(section, &stldr_info->loader.sections, lh) {
 		if (!section->do_write)
 			continue;
+
+		const uint32_t addr = stldr_section_addr(&stldr_info->loader, section);
+
+		retval = stldr_flush_code(target, ccr, addr, section->size);
+		if (retval != ERROR_OK)
+			return retval;
 
 		if (!stldr_info->loader.relocatable) {
 			if (section->addr >= working_area && (section->addr <= working_area + working_area_size)
@@ -581,12 +651,11 @@ static int stldr_write_loader(struct flash_bank *bank)
 				return ERROR_FAIL;
 			}
 
-			int retval = target_write_memory(target, section->addr, 4, section->size / 4, section->content);
+			retval = target_write_memory(target, addr, 4, section->size / 4, section->content);
 			if (retval != ERROR_OK)
 				return retval;
 		} else {
-			int retval = target_write_buffer(target, section->addr + stldr_info->loader.offset,
-							section->size, section->content);
+			retval = target_write_buffer(target, addr, section->size, section->content);
 			if (retval != ERROR_OK) {
 				target_free_working_area(target, stldr_info->loader.work_area);
 				return retval;
@@ -774,10 +843,18 @@ static int stldr_exec_function_read(struct flash_bank *bank,
 	struct stldr_func_args args;
 	stldr_func_args_set(&args, addr, size, buffer_addr, 0);
 	int retval = stldr_exec_function(bank, FUNC_ID_READ, STLDR_READ_TIMEOUT, &args);
+
+	/* The core has just filled that buffer for the debugger to collect, and
+	 * what it wrote is in its data cache. Do this whether the call got where
+	 * it was going or not: a call that failed halfway is the one that leaves
+	 * the least certainty about what is where.
+	 */
+	int flushed = stldr_flush_data(bank->target, buffer_addr, size);
+
 	if (retval != ERROR_OK || args.ret != STLDR_FUNC_SUCCESS)
 		return ERROR_FLASH_OPERATION_FAILED;
 
-	return ERROR_OK;
+	return flushed;
 }
 
 static int stldr_exec_function_write(struct flash_bank *bank,
@@ -786,10 +863,21 @@ static int stldr_exec_function_write(struct flash_bank *bank,
 	struct stldr_func_args args;
 	stldr_func_args_set(&args, addr, size, buffer_addr, 0);
 	int retval = stldr_exec_function(bank, FUNC_ID_WRITE, STLDR_WRITE_TIMEOUT, &args);
+
+	/* The core has just read that buffer and the debugger is about to fill it
+	 * with the next block, so the two views of it have to be put back in step
+	 * -- whether the call got where it was going or not, a call that failed
+	 * halfway being the one that leaves the least certainty about what is
+	 * where. The operation's own verdict still comes first: a buffer that
+	 * could not be flushed is worth reporting, but not instead of a write
+	 * that did not happen.
+	 */
+	int flushed = stldr_flush_data(bank->target, buffer_addr, size);
+
 	if (retval != ERROR_OK || args.ret != STLDR_FUNC_SUCCESS)
 		return ERROR_FLASH_OPERATION_FAILED;
 
-	return ERROR_OK;
+	return flushed;
 }
 
 static int stldr_erase(struct flash_bank *bank, unsigned int first,
@@ -1042,6 +1130,25 @@ static int stldr_protect_check(struct flash_bank *bank)
 	return ERROR_OK;
 }
 
+/* A bank id is a number like any other, and nothing about it says which driver
+ * the bank belongs to. Every subcommand below reads the bank's private state as
+ * this driver's, so a bank belonging to some other driver -- bank 0 wherever
+ * the part has internal flash of its own, since that is the bank the target
+ * configuration declares first -- has to be turned away before it is read as
+ * something it is not. Until now "stldr init 0" on such a board went looking
+ * for a loader at whatever the internal flash driver had put there and took
+ * OpenOCD down with it.
+ */
+static int stldr_check_bank(struct command_invocation *cmd, const struct flash_bank *bank)
+{
+	if (bank->driver == &stldr_flash)
+		return ERROR_OK;
+
+	command_print(cmd, "%s is not an stldr bank", bank->name);
+
+	return ERROR_COMMAND_ARGUMENT_INVALID;
+}
+
 COMMAND_HANDLER(stldr_handle_set_loader_command)
 {
 	if (CMD_ARGC < 2)
@@ -1049,6 +1156,10 @@ COMMAND_HANDLER(stldr_handle_set_loader_command)
 
 	struct flash_bank *bank;
 	int retval = CALL_COMMAND_HANDLER(flash_command_get_bank_probe_optional, 0, &bank, false);
+	if (retval != ERROR_OK)
+		return retval;
+
+	retval = stldr_check_bank(CMD, bank);
 	if (retval != ERROR_OK)
 		return retval;
 
@@ -1071,6 +1182,10 @@ COMMAND_HANDLER(stldr_handle_set_size_command)
 
 	struct flash_bank *bank;
 	int retval = CALL_COMMAND_HANDLER(flash_command_get_bank_probe_optional, 0, &bank, false);
+	if (retval != ERROR_OK)
+		return retval;
+
+	retval = stldr_check_bank(CMD, bank);
 	if (retval != ERROR_OK)
 		return retval;
 
@@ -1100,6 +1215,10 @@ COMMAND_HANDLER(stldr_handle_mass_erase_command)
 	if (retval != ERROR_OK)
 		return retval;
 
+	retval = stldr_check_bank(CMD, bank);
+	if (retval != ERROR_OK)
+		return retval;
+
 	retval = stldr_exec_function_mass_erase(bank);
 	if (retval == ERROR_OK)
 		command_print(CMD, "stldr mass erase complete");
@@ -1116,6 +1235,10 @@ COMMAND_HANDLER(stldr_handle_init_command)
 
 	struct flash_bank *bank;
 	int retval = CALL_COMMAND_HANDLER(flash_command_get_bank, 0, &bank);
+	if (retval != ERROR_OK)
+		return retval;
+
+	retval = stldr_check_bank(CMD, bank);
 	if (retval != ERROR_OK)
 		return retval;
 
