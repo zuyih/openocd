@@ -978,9 +978,6 @@ static int stm32h7_probe(struct flash_bank *bank)
 		}
 	}
 
-	LOG_INFO("Bank (%u) size is %" PRIu16 " kb, base address is " TARGET_ADDR_FMT,
-		bank->bank_number, flash_size_in_kb, bank->base);
-
 	/* if the user sets the size manually then ignore the probed value
 	 * this allows us to work around devices that have an invalid flash size register value */
 	if (stm32h7_info->user_bank_size) {
@@ -988,11 +985,16 @@ static int stm32h7_probe(struct flash_bank *bank)
 		flash_size_in_kb = stm32h7_info->user_bank_size / 1024;
 	} else if (flash_size_in_kb == 0xffff) {
 		/* die flash size */
+		LOG_INFO("ignoring flash probed value, using the device's maximum");
 		flash_size_in_kb = stm32h7_info->part_info->max_flash_size_kb;
 	}
 
 	/* did we assign flash size? */
 	assert(flash_size_in_kb != 0xffff);
+
+	LOG_INFO("Bank (%u) size is %" PRIu16 " kb, base address is " TARGET_ADDR_FMT,
+		bank->bank_number, flash_size_in_kb, bank->base);
+
 	bank->size = flash_size_in_kb * 1024;
 	bank->write_start_alignment = stm32h7_info->part_info->block_size;
 	bank->write_end_alignment = stm32h7_info->part_info->block_size;
