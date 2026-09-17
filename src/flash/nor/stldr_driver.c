@@ -604,7 +604,7 @@ static int stldr_write_loader(struct flash_bank *bank)
 		/* update loader functions offset */
 		stldr_info->loader.return_addr = stldr_info->loader.work_area->address;
 		stldr_info->loader.offset = stldr_info->loader.work_area->address + 4;
-		LOG_INFO("loader offset 0x%08X", stldr_info->loader.offset);
+		LOG_DEBUG("loader offset 0x%08X", stldr_info->loader.offset);
 	} else {
 		/* The exit point has to be a word the loader will not write over,
 		 * because armv7m_run_algorithm stops the core with a software
@@ -625,7 +625,7 @@ static int stldr_write_loader(struct flash_bank *bank)
 
 		stldr_info->loader.return_addr = stldr_info->loader.work_area->address;
 		stldr_info->loader.offset = stldr_info->loader.code_addr;
-		LOG_INFO("loader offset 0x%08X", stldr_info->loader.offset);
+		LOG_DEBUG("loader offset 0x%08X", stldr_info->loader.offset);
 	}
 
 	uint32_t ccr;
@@ -946,8 +946,8 @@ static int stldr_write(struct flash_bank *bank, const uint8_t *buffer,
 	//	buffer_size = 16384;
 	//}
 
-	LOG_INFO("workarea size: %x", buffer_size);
-	LOG_INFO("workarea address: " TARGET_ADDR_FMT, bank->target->working_area_phys);
+	LOG_DEBUG("workarea size: %" PRIx32, buffer_size);
+	LOG_DEBUG("workarea address: " TARGET_ADDR_FMT, bank->target->working_area_phys);
 
 	/* The flash write must be aligned to the 'stldr_info->data_width' boundary.
 	 * The flash infrastructure ensures it, do just a security check */
