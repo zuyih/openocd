@@ -34,6 +34,27 @@ tc2x_safety_endinit(uint32_t endinit) {
 }
 #endif
 
+#if defined(TC3X_FLASH_PFLASH) || defined(TC3X_FLASH_DFLASH)
+/*
+ * TC3x refuses PFLASH and DFLASH commands with a protection error while the
+ * Safety ENDINIT is set, which is how startup code leaves it. Take it down
+ * around the command as iLLD does, with the password sequence TC2x uses.
+ */
+static inline uint32_t __attribute__((always_inline))
+tc3x_safety_endinit(uint32_t endinit) {
+  uint32_t i;
+  const uint32_t value = TC3X_WDTS_CON0;
+
+  TC3X_WDTS_CON0 = (value & 0xFFFFFF00u) | (~value & 0xFCu) | 0x01u;
+  TC3X_WDTS_CON0 = (value & 0xFFFFFF00u) | (~value & 0xFCu) | 0x02u | endinit;
+  for (i = 0; i < 100000u; i++) {
+    if ((TC3X_WDTS_CON0 & 1u) == endinit)
+      return 0;
+  }
+  return 1u << 28;
+}
+#endif
+
 static inline void __attribute__((always_inline)) clear_status(void) {
   mmio_write_u32(HOST_CMD_ADDR + 0x5554u, 0xFAu);
   mmio_barrier();
@@ -92,6 +113,11 @@ int __attribute__((noreturn)) main(void *buffer_start, uint32_t buffer_size,
   }
   const uint32_t prmode = FLASH_SET_PRMODE();
 
+#if defined(TC3X_FLASH_PFLASH) || defined(TC3X_FLASH_DFLASH)
+  /* Out of reset the Safety ENDINIT is clear; leave it alone then. */
+  const bool endinit_set = TC3X_WDTS_CON0 & 1u;
+#endif
+
   while (size) {
     uint32_t i;
     uintptr_t cur_rptr = *rptr;
@@ -145,6 +171,13 @@ int __attribute__((noreturn)) main(void *buffer_start, uint32_t buffer_size,
     if (ret)
       goto out;
 #endif
+#if defined(TC3X_FLASH_PFLASH) || defined(TC3X_FLASH_DFLASH)
+    if (endinit_set) {
+      ret = tc3x_safety_endinit(0u);
+      if (ret)
+        goto out;
+    }
+#endif
 
     /* Issue page write command */
     mmio_write_u32(HOST_CMD_ADDR + 0xAA50u, (uint32_t)addr);
@@ -157,6 +190,13 @@ int __attribute__((noreturn)) main(void *buffer_start, uint32_t buffer_size,
     ret = tc2x_safety_endinit(1u);
     if (ret)
       goto out;
+#endif
+#if defined(TC3X_FLASH_PFLASH) || defined(TC3X_FLASH_DFLASH)
+    if (endinit_set) {
+      ret = tc3x_safety_endinit(1u);
+      if (ret)
+        goto out;
+    }
 #endif
 
     size -= (uint32_t)copy_size;
