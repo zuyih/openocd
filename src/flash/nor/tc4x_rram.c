@@ -277,7 +277,8 @@ static void tc4x_rram_decode_algo_status(uint32_t status, char *err_str, size_t 
 
 static int tc4x_rram_queue_clear_status(struct ocmts *ocmts, target_addr_t module_base)
 {
-	uint32_t clr = UR_CLRSTAT_CLEAR_ALL;
+	/* Queued by address and only read when the queue runs. */
+	static const uint32_t clr = UR_CLRSTAT_CLEAR_ALL;
 
 	return ocmts_queue_write_u32(ocmts, module_base + UR_CLRSTAT_OFFSET, &clr);
 }
@@ -447,7 +448,9 @@ static int tc4x_rram_probe(struct flash_bank *bank)
 	if (retval != ERROR_OK)
 		return retval;
 
-	bank->minimal_write_gap = FLASH_WRITE_GAP_SECTOR;
+	/* RRAM is written in place, so a gap merged into a write is lost: merge
+	 * no more than a page. */
+	bank->minimal_write_gap = rram_bank->page_size;
 	bank->write_start_alignment = rram_bank->page_size;
 	bank->write_end_alignment = rram_bank->page_size;
 	bank->num_sectors = bank->size / rram_bank->sector_size;
@@ -459,7 +462,7 @@ static int tc4x_rram_probe(struct flash_bank *bank)
 		bank->sectors[i].size = rram_bank->sector_size;
 		bank->sectors[i].offset = flash_addr - bank->base;
 		flash_addr += rram_bank->sector_size;
-		bank->sectors[i].is_erased = 1;
+		bank->sectors[i].is_erased = -1;
 		bank->sectors[i].is_protected = -1;
 	}
 
@@ -482,24 +485,24 @@ static int tc4x_rram_erase(struct flash_bank *bank, unsigned int first, unsigned
 	struct tc4x_rram_bank *rram_bank = bank->driver_priv;
 
 	if (rram_bank->type == TC4X_RRAM_UCB && !rram_bank->ucb_unlocked) {
-		LOG_WARNING("UCB bank has not been unlocked. Skipping operation.");
-		return ERROR_OK;
+		/* Skipping quietly would let the caller take the UCB as written. */
+		LOG_ERROR("Writing the user configuration blocks is not supported");
+		return ERROR_FLASH_OPER_UNSUPPORTED;
 	}
 
 	if (first > last || last >= bank->num_sectors)
 		return ERROR_FLASH_SECTOR_INVALID;
 
-	for (unsigned int i = first; i <= last; i++)
-		bank->sectors[i].is_erased = 1;
-
-	LOG_INFO("TC4x RRAM does not require erase; operation treated as success.");
+	/* Succeed, so that "flash write_image erase" works, but do not claim
+	 * that anything was erased. */
+	LOG_WARNING("TC4x RRAM needs no erase and was left unchanged");
 	return ERROR_OK;
 }
 
 static int tc4x_rram_erase_check(struct flash_bank *bank)
 {
 	for (unsigned int i = 0; i < bank->num_sectors; i++)
-		bank->sectors[i].is_erased = 1;
+		bank->sectors[i].is_erased = -1;
 
 	return ERROR_OK;
 }
@@ -586,8 +589,9 @@ static int tc4x_rram_write(struct flash_bank *bank, const uint8_t *buffer,
 	int ret;
 
 	if (rram_bank->type == TC4X_RRAM_UCB && !rram_bank->ucb_unlocked) {
-		LOG_WARNING("UCB bank has not been unlocked. Skipping operation.");
-		return ERROR_OK;
+		/* Skipping quietly would let the caller take the UCB as written. */
+		LOG_ERROR("Writing the user configuration blocks is not supported");
+		return ERROR_FLASH_OPER_UNSUPPORTED;
 	}
 
 	if (bank->target->state != TARGET_HALTED) {

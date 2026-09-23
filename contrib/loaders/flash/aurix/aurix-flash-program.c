@@ -90,7 +90,7 @@ int __attribute__((noreturn)) main(void *buffer_start, uint32_t buffer_size,
     ret = ERROR_BUSY;
     goto out_noclear;
   }
-  FLASH_SET_PRMODE();
+  const uint32_t prmode = FLASH_SET_PRMODE();
 
   while (size) {
     uint32_t i;
@@ -113,9 +113,13 @@ int __attribute__((noreturn)) main(void *buffer_start, uint32_t buffer_size,
 #endif
 
     for (i = 0; i < copy_size; i += 8u) {
-      /* Wait until there is space in the FIFO */
-      while (*wptr == cur_rptr) {
+      uintptr_t cur_wptr;
+
+      /* Wait for data; the host clears the write pointer to abort */
+      while ((cur_wptr = *wptr) == cur_rptr) {
       }
+      if (cur_wptr == 0u)
+        goto out;
 
       mmio_write_u64(HOST_CMD_ADDR + 0x55F0u, *(uint64_t *)(cur_rptr));
       mmio_barrier();
@@ -166,11 +170,13 @@ int __attribute__((noreturn)) main(void *buffer_start, uint32_t buffer_size,
       goto out;
   }
 
+  FLASH_RESTORE_PRMODE(prmode);
   goto out_noerr;
 
 out:
   mmio_write_u32(HOST_CMD_ADDR + 0x5554u, 0xF0u);
   clear_status();
+  FLASH_RESTORE_PRMODE(prmode);
 out_noclear:
   *rptr = 0u;
 out_noerr:

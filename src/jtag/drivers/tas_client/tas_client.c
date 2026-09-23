@@ -40,8 +40,11 @@
 #include "tas_protocol.h"
 
 static struct tas_client tas_client = {.max_pl2rq_pkt_size = 1024, .max_pl2rsp_pkt_size = 1024, .pl0_max_num_rw = 128};
-static const char *server_host = "localhost";
-static const char *server_port = "24817";
+/* Set by "tas-client host", else the defaults below are used. */
+static char *server_host;
+static char *server_port;
+#define TAS_SERVER_DEFAULT_HOST "localhost"
+#define TAS_SERVER_DEFAULT_PORT "24817"
 static uint32_t current_address;
 static struct tas_client_mem_req mem_reqs[256];
 static size_t mem_req_num;
@@ -49,12 +52,52 @@ static tas_target_info_st target;
 static bool harr;
 static bool porst;
 
+/*
+ * Without "adapter serial", take the first attached device whose type is one
+ * of the IDs a declared TAP expects, so that a board configuration finds its
+ * own device when devices of other types are attached as well. With no TAP
+ * declared at all, fall back to the first device.
+ */
+static const tas_target_info_st *tas_client_find_target(const tas_target_info_st *targets, size_t target_num,
+														 unsigned int *matches)
+{
+	const tas_target_info_st *found = NULL;
+
+	*matches = 0;
+	if (!jtag_all_taps()) {
+		*matches = 1;
+		return &targets[0];
+	}
+
+	for (size_t i = 0; i < target_num; i++) {
+		for (struct jtag_tap *tap = jtag_all_taps(); tap; tap = tap->next_tap) {
+			bool hit = false;
+
+			if (!tap->enabled)
+				continue;
+			for (unsigned int j = 0; j < tap->expected_ids_cnt; j++)
+				if (targets[i].device_type == tap->expected_ids[j])
+					hit = true;
+			if (hit) {
+				if (!found)
+					found = &targets[i];
+				(*matches)++;
+				break;
+			}
+		}
+	}
+
+	return found;
+}
+
 static int tas_client_init(void)
 {
 	int err = ERROR_OK, sock = -1;
 	struct addrinfo hints;
 	struct addrinfo *result, *rp;
 	const char *serial = adapter_get_required_serial();
+	const char *host = server_host ? server_host : TAS_SERVER_DEFAULT_HOST;
+	const char *port = server_port ? server_port : TAS_SERVER_DEFAULT_PORT;
 	tas_target_info_st *targets;
 	size_t target_num;
 
@@ -64,14 +107,15 @@ static int tas_client_init(void)
 	hints.ai_flags = AI_PASSIVE;
 	hints.ai_protocol = IPPROTO_TCP;
 
-	LOG_INFO("Connecting to TAS server %s:%s", server_host, server_port);
+	LOG_INFO("Connecting to TAS server %s:%s", host, port);
 
-	err = getaddrinfo(server_host, server_port, &hints, &result);
+	err = getaddrinfo(host, port, &hints, &result);
 	if (err != 0) {
-		LOG_ERROR("Failed to get address for host %s", server_host);
+		LOG_ERROR("Failed to get address for host %s", host);
 		return ERROR_FAIL;
 	}
 
+	err = -1;
 	for (rp = result; rp; rp = rp->ai_next) {
 		sock = socket(rp->ai_family, rp->ai_socktype, rp->ai_protocol);
 		if (sock == -1)
@@ -85,12 +129,15 @@ static int tas_client_init(void)
 		err = connect(sock, rp->ai_addr, rp->ai_addrlen);
 		if (err == 0)
 			break;
+		/* e.g. ::1 first while the server listens on 127.0.0.1 only */
+		close(sock);
+		sock = -1;
 	}
 
 	freeaddrinfo(result);
 
 	if (err != 0) {
-		LOG_ERROR("Failed to connect to %s:%s", server_host, server_port);
+		LOG_ERROR("Failed to connect to %s:%s", host, port);
 		return ERROR_CONNECTION_REJECTED;
 	}
 
@@ -110,7 +157,21 @@ static int tas_client_init(void)
 	}
 
 	if (!serial) {
-		target = targets[0];
+		unsigned int matches;
+		const tas_target_info_st *found = tas_client_find_target(targets, target_num, &matches);
+
+		if (!found) {
+			LOG_ERROR("None of the attached devices is of a type a declared TAP expects:");
+			for (size_t i = 0; i < target_num; i++)
+				LOG_ERROR("  \"%s\", device type 0x%08" PRIx32, targets[i].identifier,
+						  targets[i].device_type);
+			free(targets);
+			return ERROR_FAIL;
+		}
+		if (matches > 1)
+			LOG_WARNING("%u attached devices match, using \"%s\"; pick one with: adapter serial \"<identifier>\"",
+						matches, found->identifier);
+		target = *found;
 	} else {
 		bool found = false;
 		for (size_t i = 0; i < target_num; i++) {
@@ -142,6 +203,10 @@ static int tas_client_init(void)
 static int tas_client_quit(void)
 {
 	close(tas_client.sock);
+	free(server_host);
+	server_host = NULL;
+	free(server_port);
+	server_port = NULL;
 	return 0;
 }
 
@@ -200,8 +265,8 @@ static int tas_client_op_run(struct ocmts *ocds)
 		if (LOG_LEVEL_IS(LOG_LVL_DEBUG)) {
 			for (size_t i = 0; i < mem_req_num; i++) {
 				struct tas_client_mem_req *req = &mem_reqs[i];
-				uint32_t data;
-				memcpy(&data, req->buffer, MAX(4, req->length));
+				uint32_t data = 0;
+				memcpy(&data, req->buffer, MIN(sizeof(data), req->length));
 				LOG_DEBUG("TAS PL0 request[%zu]: %s addr=0x%08" PRIx32 
 							" length=%zu data=0x%08" PRIx32,
 							i, req->is_read ? "read" : "write", req->addr, req->length, data);
@@ -256,14 +321,27 @@ static int tas_client_set_address(struct ocmts *ocds, uint32_t addr)
 	return ERROR_OK;
 }
 
+/*
+ * Make room in a full queue. The queue is empty afterwards also when running
+ * it fails: its requests point into buffers that the caller gives up as soon
+ * as it sees the error.
+ */
+static int tas_client_queue_make_room(void)
+{
+	int ret;
+
+	if (mem_req_num < ARRAY_SIZE(mem_reqs))
+		return ERROR_OK;
+
+	ret = tas_client_execute_mem_reqs(&tas_client, 0, mem_reqs, mem_req_num);
+	mem_req_num = 0;
+	return ret ? ERROR_FAIL : ERROR_OK;
+}
+
 static int tas_client_read_byte(struct ocmts *ocds, uint8_t *data)
 {
-	if (mem_req_num >= 256) {
-		int ret = tas_client_execute_mem_reqs(&tas_client, 0, mem_reqs, mem_req_num);
-		if (ret)
-			return ERROR_FAIL;
-		mem_req_num = 0;
-	}
+	if (tas_client_queue_make_room() != ERROR_OK)
+		return ERROR_FAIL;
 	mem_reqs[mem_req_num].addr = current_address;
 	mem_reqs[mem_req_num].buffer = (void *)data;
 	mem_reqs[mem_req_num].length = 1;
@@ -279,12 +357,8 @@ static int tas_client_read_hword(struct ocmts *ocds, uint16_t *data)
 		LOG_ERROR("Half-Word write address must be 2-byte aligned");
 		return ERROR_FAIL;
 	}
-	if (mem_req_num >= 256) {
-		int ret = tas_client_execute_mem_reqs(&tas_client, 0, mem_reqs, mem_req_num);
-		if (ret)
-			return ERROR_FAIL;
-		mem_req_num = 0;
-	}
+	if (tas_client_queue_make_room() != ERROR_OK)
+		return ERROR_FAIL;
 	mem_reqs[mem_req_num].addr = current_address;
 	mem_reqs[mem_req_num].buffer = (void *)data;
 	mem_reqs[mem_req_num].length = 2;
@@ -300,17 +374,47 @@ static int tas_client_read_word(struct ocmts *ocds, uint32_t *data)
 		LOG_ERROR("Word write address must be 4-byte aligned");
 		return ERROR_FAIL;
 	}
-	if (mem_req_num >= 256) {
-		int ret = tas_client_execute_mem_reqs(&tas_client, 0, mem_reqs, mem_req_num);
-		if (ret)
-			return ERROR_FAIL;
-		mem_req_num = 0;
-	}
+	if (tas_client_queue_make_room() != ERROR_OK)
+		return ERROR_FAIL;
 	mem_reqs[mem_req_num].addr = current_address;
 	mem_reqs[mem_req_num].buffer = (void *)data;
 	mem_reqs[mem_req_num].length = 4;
 	mem_reqs[mem_req_num].is_read = true;
 	mem_req_num++;
+
+	return ERROR_OK;
+}
+
+/*
+ * Queue a block transfer as requests that each fit a packet. A full 256-word
+ * write need not: with the headers around it, it takes 1052 bytes, where the
+ * TAS server for the Lite kits allows 1048.
+ */
+static int tas_client_queue_block(void *data, size_t length, bool is_read)
+{
+	size_t max_words = tas_client_max_block_words(&tas_client, is_read);
+	uint8_t *p = data;
+
+	if (max_words == 0) {
+		LOG_ERROR("TAS packets are too small for block transfers");
+		return ERROR_FAIL;
+	}
+
+	while (length) {
+		size_t words = MIN(length, max_words);
+
+		if (tas_client_queue_make_room() != ERROR_OK)
+			return ERROR_FAIL;
+		mem_reqs[mem_req_num].addr = current_address;
+		mem_reqs[mem_req_num].buffer = p;
+		mem_reqs[mem_req_num].length = words * 4;
+		mem_reqs[mem_req_num].is_read = is_read;
+		mem_req_num++;
+
+		current_address += words * 4;
+		p += words * 4;
+		length -= words;
+	}
 
 	return ERROR_OK;
 }
@@ -325,29 +429,14 @@ static int tas_client_read_block(struct ocmts *ocds, void *data, size_t length)
 		LOG_ERROR("Block read address must be 4-byte aligned");
 		return ERROR_FAIL;
 	}
-	if (mem_req_num >= 256) {
-		int ret = tas_client_execute_mem_reqs(&tas_client, 0, mem_reqs, mem_req_num);
-		if (ret)
-			return ERROR_FAIL;
-		mem_req_num = 0;
-	}
-	mem_reqs[mem_req_num].addr = current_address;
-	mem_reqs[mem_req_num].buffer = data;
-	mem_reqs[mem_req_num].length = length * 4;
-	mem_reqs[mem_req_num].is_read = true;
-	mem_req_num++;
 
-	return ERROR_OK;
+	return tas_client_queue_block(data, length, true);
 }
 
 static int tas_client_write_byte(struct ocmts *ocds, const void *data)
 {
-	if (mem_req_num >= 256) {
-		int ret = tas_client_execute_mem_reqs(&tas_client, 0, mem_reqs, mem_req_num);
-		if (ret)
-			return ERROR_FAIL;
-		mem_req_num = 0;
-	}
+	if (tas_client_queue_make_room() != ERROR_OK)
+		return ERROR_FAIL;
 	mem_reqs[mem_req_num].addr = current_address;
 	mem_reqs[mem_req_num].buffer = (void *)data;
 	mem_reqs[mem_req_num].length = 1;
@@ -363,12 +452,8 @@ static int tas_client_write_hword(struct ocmts *ocds, const void *data)
 		LOG_ERROR("Half-Word write address must be 2-byte aligned");
 		return ERROR_FAIL;
 	}
-	if (mem_req_num >= 256) {
-		int ret = tas_client_execute_mem_reqs(&tas_client, 0, mem_reqs, mem_req_num);
-		if (ret)
-			return ERROR_FAIL;
-		mem_req_num = 0;
-	}
+	if (tas_client_queue_make_room() != ERROR_OK)
+		return ERROR_FAIL;
 	mem_reqs[mem_req_num].addr = current_address;
 	mem_reqs[mem_req_num].buffer = (void *)data;
 	mem_reqs[mem_req_num].length = 2;
@@ -384,12 +469,8 @@ static int tas_client_write_word(struct ocmts *ocds, const void *data)
 		LOG_ERROR("Word write address must be 4-byte aligned");
 		return ERROR_FAIL;
 	}
-	if (mem_req_num >= 256) {
-		int ret = tas_client_execute_mem_reqs(&tas_client, 0, mem_reqs, mem_req_num);
-		if (ret)
-			return ERROR_FAIL;
-		mem_req_num = 0;
-	}
+	if (tas_client_queue_make_room() != ERROR_OK)
+		return ERROR_FAIL;
 	mem_reqs[mem_req_num].addr = current_address;
 	mem_reqs[mem_req_num].buffer = (void *)data;
 	mem_reqs[mem_req_num].length = 4;
@@ -409,19 +490,8 @@ static int tas_client_write_block(struct ocmts *ocds, const void *data, size_t l
 		LOG_ERROR("Block write address must be 4-byte aligned");
 		return ERROR_FAIL;
 	}
-	if (mem_req_num >= 256) {
-		int ret = tas_client_execute_mem_reqs(&tas_client, 0, mem_reqs, mem_req_num);
-		if (ret)
-			return ERROR_FAIL;
-		mem_req_num = 0;
-	}
-	mem_reqs[mem_req_num].addr = current_address;
-	mem_reqs[mem_req_num].buffer = (void *)data;
-	mem_reqs[mem_req_num].length = length * 4;
-	mem_reqs[mem_req_num].is_read = false;
-	mem_req_num++;
 
-	return ERROR_OK;
+	return tas_client_queue_block((void *)data, length, false);
 }
 
 static int tas_client_set_ojconf(struct ocmts *ocds, uint16_t ojconf)
@@ -490,9 +560,16 @@ COMMAND_HANDLER(tas_client_cmd_host)
 	if (CMD_ARGC < 1 || CMD_ARGC > 2)
 		return ERROR_COMMAND_SYNTAX_ERROR;
 
+	free(server_host);
 	server_host = strdup(CMD_ARGV[0]);
-	if (CMD_ARGC == 2)
+	if (CMD_ARGC == 2) {
+		free(server_port);
 		server_port = strdup(CMD_ARGV[1]);
+	}
+	if (!server_host || (CMD_ARGC == 2 && !server_port)) {
+		LOG_ERROR("Out of memory");
+		return ERROR_FAIL;
+	}
 
 	return ERROR_OK;
 }
@@ -518,7 +595,9 @@ static const struct command_registration tas_client_command_handlers[] = {{
 struct adapter_driver tas_client_adapter_driver = {
 	.name = "tas_client",
 	.commands = tas_client_command_handlers,
-	.transport_ids = TRANSPORT_JTAG | TRANSPORT_IFXDAP,
+	/* Only the OCMTS operations are implemented; there is no JTAG queue to
+	 * offer a jtag transport with. */
+	.transport_ids = TRANSPORT_IFXDAP,
 	.transport_preferred_id = TRANSPORT_IFXDAP,
 	.ocmts_ops = &ocmts_ops_interface,
 	.ifxdap_ops = &ifxdap_ops,

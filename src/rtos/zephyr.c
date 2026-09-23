@@ -425,6 +425,9 @@ static int zephyr_get_tricore_state(struct rtos *rtos, target_addr_t *addr,
 
   ret = rtos_generic_stack_read(rtos->target, params->cpu_saved_nofp_stacking,
                                 *addr, reg_list, num_regs);
+  /* e.g. a thread whose context list ends (PCXI 0) */
+  if (ret != ERROR_OK)
+    return ret;
 
   /* Load next context from register */
   ctx = buf_get_u32((*reg_list)[TRICORE_PCXI].value, 0, 32);
@@ -433,11 +436,18 @@ static int zephyr_get_tricore_state(struct rtos *rtos, target_addr_t *addr,
   ret = rtos_generic_stack_read(rtos->target, params->callee_saved_stacking,
                                 *addr, &callee_saved_reg_list,
                                 &num_callee_saved_regs);
+  if (ret != ERROR_OK) {
+    free(*reg_list);
+    *reg_list = NULL;
+    return ret;
+  }
 
   for (i = 0; i < num_callee_saved_regs; i++)
     buf_cpy(callee_saved_reg_list[i].value,
             (*reg_list)[callee_saved_reg_list[i].number].value,
             callee_saved_reg_list[i].size);
+  /* Allocated just above; the caller only ever sees its own copy. */
+  free(callee_saved_reg_list);
 
   struct reg *a0 = register_get_by_name(rtos->target->reg_cache, "a0", false);
   struct reg *a1 = register_get_by_name(rtos->target->reg_cache, "a1", false);

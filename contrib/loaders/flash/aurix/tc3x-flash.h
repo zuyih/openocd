@@ -61,9 +61,8 @@
 #endif
 
 /* TC3x has no host-interface programming mode bit. */
-#define FLASH_SET_PRMODE()                                                     \
-  do {                                                                         \
-  } while (0)
+#define FLASH_SET_PRMODE() 0u
+#define FLASH_RESTORE_PRMODE(config) ((void)(config))
 
 #define WRITE_TIMEOUT_TICKS (530ull * 300ull)
 

@@ -38,12 +38,27 @@
 #define DMU_STATUS_CS_ANYBUSY                                                  \
   (DMU_STATUS_PFBUSY | DMU_STATUS_BUSYCSRMDF | DMU_STATUS_BUSYCSRMPF)
 
-/* DMU_{HCI,CSCI}_OCONTROL bits */
+/*
+ * DMU_{HCI,CSCI}_OCONTROL configuration bits. The others request an action
+ * (ABORT, CLEAR, clearing state flags) or are reserved, and are written as 0.
+ */
+#define DMU_OCONTROL_UCG (1u << 8)
 #define DMU_OCONTROL_PRMODE (1u << 9)
+#define DMU_OCONTROL_PMPMODE (1u << 10)
+#define DMU_OCONTROL_CONFIG                                                    \
+  (DMU_OCONTROL_UCG | DMU_OCONTROL_PRMODE | DMU_OCONTROL_PMPMODE)
 
-static inline void __attribute__((always_inline))
+/*
+ * Program PFLASH in one pulse of 256 bits. The mode stays in force until it
+ * is changed, also for the application's own writes, so hand back the
+ * configuration to restore.
+ */
+static inline uint32_t __attribute__((always_inline))
 flash_set_prmode(uintptr_t addr) {
-  mmio_write_u32(addr, mmio_read_u32(addr) | DMU_OCONTROL_PRMODE);
+  const uint32_t config = mmio_read_u32(addr) & DMU_OCONTROL_CONFIG;
+
+  mmio_write_u32(addr, config | DMU_OCONTROL_PRMODE);
+  return config;
 }
 
 #if defined(TC4X_FLASH_PFLASH) || defined(TC4X_FLASH_DFLASH)
@@ -73,6 +88,8 @@ flash_set_prmode(uintptr_t addr) {
 #define FLASH_BUSY()                                                           \
   (!!(mmio_read_u32(DMU_HCI_STATUS_ADDR) & DMU_STATUS_HOST_ANYBUSY))
 #define FLASH_SET_PRMODE() flash_set_prmode(DMU_HCI_OCONTROL_ADDR)
+#define FLASH_RESTORE_PRMODE(config)                                           \
+  mmio_write_u32(DMU_HCI_OCONTROL_ADDR, (config))
 #elif defined(TC4X_FLASH_DFLASH)
 #define FLASH_WRITE_CMD(burst_mode) ((burst_mode) ? 0xA6u : 0xAAu)
 #define FLASH_ERRSR() mmio_read_u32(DMU_HCI_ERR_ADDR)
@@ -84,6 +101,8 @@ flash_set_prmode(uintptr_t addr) {
 #define FLASH_BUSY()                                                           \
   (!!(mmio_read_u32(DMU_HCI_STATUS_ADDR) & DMU_STATUS_HOST_ANYBUSY))
 #define FLASH_SET_PRMODE() flash_set_prmode(DMU_HCI_OCONTROL_ADDR)
+#define FLASH_RESTORE_PRMODE(config)                                           \
+  mmio_write_u32(DMU_HCI_OCONTROL_ADDR, (config))
 #elif defined(TC4X_FLASH_PFLASHCS)
 #define FLASH_WRITE_CMD(burst_mode) ((burst_mode) ? 0xA6u : 0xAAu)
 #define FLASH_ERRSR() mmio_read_u32(DMU_CSCI_ERR_ADDR)
@@ -95,6 +114,8 @@ flash_set_prmode(uintptr_t addr) {
 #define FLASH_BUSY()                                                           \
   (!!(mmio_read_u32(DMU_CSCI_STATUS_ADDR) & DMU_STATUS_CS_ANYBUSY))
 #define FLASH_SET_PRMODE() flash_set_prmode(DMU_CSCI_OCONTROL_ADDR)
+#define FLASH_RESTORE_PRMODE(config)                                           \
+  mmio_write_u32(DMU_CSCI_OCONTROL_ADDR, (config))
 #elif defined(TC4X_FLASH_DFLASHCS)
 #define FLASH_WRITE_CMD(burst_mode) ((burst_mode) ? 0xA6u : 0xAAu)
 #define FLASH_ERRSR() mmio_read_u32(DMU_CSCI_ERR_ADDR)
@@ -106,6 +127,8 @@ flash_set_prmode(uintptr_t addr) {
 #define FLASH_BUSY()                                                           \
   (!!(mmio_read_u32(DMU_CSCI_STATUS_ADDR) & DMU_STATUS_CS_ANYBUSY))
 #define FLASH_SET_PRMODE() flash_set_prmode(DMU_CSCI_OCONTROL_ADDR)
+#define FLASH_RESTORE_PRMODE(config)                                           \
+  mmio_write_u32(DMU_CSCI_OCONTROL_ADDR, (config))
 #endif
 
 #define WRITE_TIMEOUT_TICKS (550ull * 500ull)

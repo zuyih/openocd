@@ -53,12 +53,13 @@ int __attribute__((noreturn)) main(void *buffer_start, uint32_t buffer_size,
 
     uint32_t i;
     for (i = 0; i < PAGE_SIZE / 4u; i++) {
+      uint32_t write_ptr;
+
       /* Wait for data, the host clears the write pointer to abort */
-      while (*wptr == read_ptr) {
-        if (*wptr == 0u) {
-          goto out;
-        }
+      while ((write_ptr = *wptr) == read_ptr) {
       }
+      if (write_ptr == 0u)
+        goto out;
 
       mmio_write_u32(rram + RRAM_UR_WDATA + i * 4u, mmio_read_u32(read_ptr));
       mmio_barrier();

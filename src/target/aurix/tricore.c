@@ -17,6 +17,7 @@
 #include "helper/binarybuffer.h"
 #include "helper/command.h"
 #include "helper/log.h"
+#include "helper/time_support.h"
 #include "helper/types.h"
 #include "jtag/interface.h"
 #include "jtag/jtag.h"
@@ -85,6 +86,12 @@ static struct reg_feature tricore_core_feature = {
 	.name = "org.gnu.gdb.tricore.core",
 };
 
+/* Shared by the registers of all cores, and never freed. */
+static struct reg_data_type tricore_type_int = {.type = REG_TYPE_INT};
+static struct reg_data_type tricore_type_data_ptr = {.type = REG_TYPE_DATA_PTR};
+static struct reg_data_type tricore_type_code_ptr = {.type = REG_TYPE_CODE_PTR};
+static struct reg_data_type tricore_type_uint32 = {.type = REG_TYPE_UINT32};
+
 static int tricore_build_reg_cache(struct target *target, const struct reg_arch_type *type)
 {
 	const int num_regs = ARRAY_SIZE(tricore_core_regs);
@@ -121,15 +128,14 @@ static int tricore_build_reg_cache(struct target *target, const struct reg_arch_
 		reg_list[i].exist = true;
 
 		/* Registers data type, as used by GDB target description */
-		reg_list[i].reg_data_type = calloc(1, sizeof(struct reg_data_type));
 		if (i < 16)
-			reg_list[i].reg_data_type->type = REG_TYPE_INT;
+			reg_list[i].reg_data_type = &tricore_type_int;
 		else if (i < 32)
-			reg_list[i].reg_data_type->type = REG_TYPE_DATA_PTR;
+			reg_list[i].reg_data_type = &tricore_type_data_ptr;
 		else if (i == 34)
-			reg_list[i].reg_data_type->type = REG_TYPE_CODE_PTR;
+			reg_list[i].reg_data_type = &tricore_type_code_ptr;
 		else
-			reg_list[i].reg_data_type->type = REG_TYPE_UINT32;
+			reg_list[i].reg_data_type = &tricore_type_uint32;
 
 		reg_list[i].feature = &tricore_core_feature;
 		reg_list[i].group = "general";
@@ -144,6 +150,10 @@ static int tricore_build_reg_cache(struct target *target, const struct reg_arch_
 
 static void tricore_free_reg_cache(struct target *target)
 {
+	/* Built by init_target(), which a configuration error can prevent. */
+	if (!target->reg_cache)
+		return;
+
 	free(target->reg_cache->reg_list->arch_info);
 	free(target->reg_cache->reg_list);
 	free(target->reg_cache);
@@ -250,12 +260,15 @@ static inline void tricore_examin_debug_reason(struct target *target)
 {
 	struct tricore_info *tricore = target_to_tricore(target);
 	tricore->halted = (tricore->dbgsr & 0x2) != 0;
-	tricore->active_event = (tricore->dbgsr >> 8) & 0xF;
+	/* DBGSR.EVTSRC is 5 bits wide: a trigger n reports as 0x10 + n. */
+	tricore->active_event = (tricore->dbgsr >> 8) & 0x1F;
 	tricore->suspended = (tricore->dbgsr & 0x8) != 0;
 
 	LOG_TARGET_DEBUG(target, "DBGSR halt: %d suspended: %d event: %d", tricore->halted, tricore->suspended,
 					 tricore->active_event);
-	if (target->debug_reason == DBG_REASON_SINGLESTEP)
+	/* A step, or a halt OpenOCD asked for: EVTSRC does not change for the
+	 * latter and still names whatever halted the core before. */
+	if (target->debug_reason == DBG_REASON_SINGLESTEP || target->debug_reason == DBG_REASON_DBGRQ)
 		return;
 
 	/* Check for suspend in halt*/
@@ -286,18 +299,61 @@ static inline void tricore_examin_debug_reason(struct target *target)
 	}
 }
 
+/*
+ * Find out which register set the core is using before anything reads one.
+ *
+ * Software is free to switch virtualization off, which TC4x startup code
+ * does: TCCON.HVE then reads back clear and the VM windows stop answering,
+ * so the state seen at examine cannot be relied upon. TCCON lives in the
+ * HRA window, which answers either way, and the VM registers are only asked
+ * once TCCON says they are there.
+ */
+static int tricore_update_virt_state(struct target *target)
+{
+	struct tricore_info *tricore = target_to_tricore(target);
+	uint32_t tccon, vcon0 = 0, vcon1 = 0;
+	int ret;
+
+	/* Virt 1 (HRA) is the default */
+	tricore->virt_enabled = false;
+	tricore->active_vm = 1;
+
+	if (tricore->version != TRICORE_1_8)
+		return ERROR_OK;
+
+	ret = ocmts_io_read_u32(tricore->ocmts, tricore_get_reg_addr(target, TRICORE_TCCON), &tccon);
+	if (ret)
+		return ret;
+	if (!(tccon & 0x8))
+		return ERROR_OK;
+
+	ret = ocmts_queue_read_u32(tricore->ocmts, tricore_get_reg_addr(target, TRICORE_VCON0), &vcon0);
+	ret |= ocmts_queue_read_u32(tricore->ocmts, tricore_get_reg_addr(target, TRICORE_VCON1), &vcon1);
+	ret |= ocmts_run(tricore->ocmts);
+	if (ret)
+		return ERROR_FAIL;
+
+	if (vcon0 & 0x1) {
+		tricore->virt_enabled = true;
+		tricore->active_vm = vcon1 & 0xF;
+	}
+
+	return ERROR_OK;
+}
+
 static int tricore_debug_entry(struct target *target)
 {
 	struct tricore_info *tricore = target_to_tricore(target);
-	uint32_t vcon0, vcon1;
 	int ret = 0;
+
+	ret = tricore_update_virt_state(target);
+	if (ret) {
+		LOG_TARGET_ERROR(target, "failed to read virtualization state");
+		return ERROR_FAIL;
+	}
 
 	ret |= ocmts_queue_read_u32(tricore->ocmts, tricore_get_reg_addr(target, TRICORE_DBGSR), &tricore->dbgsr);
 	ret |= ocmts_queue_read_u32(tricore->ocmts, tricore_get_reg_addr(target, TRICORE_ICR), &tricore->icr);
-	if (tricore->version == TRICORE_1_8 && tricore->virt_enabled) {
-		ret |= ocmts_queue_read_u32(tricore->ocmts, tricore_get_reg_addr(target, TRICORE_VCON0), &vcon0);
-		ret |= ocmts_queue_read_u32(tricore->ocmts, tricore_get_reg_addr(target, TRICORE_VCON1), &vcon1);
-	}
 	ret |= ocmts_run(tricore->ocmts);
 	if (ret) {
 		LOG_TARGET_ERROR(target, "failed to read status registers");
@@ -305,17 +361,6 @@ static int tricore_debug_entry(struct target *target)
 	}
 
 	tricore_examin_debug_reason(target);
-
-	if (tricore->version == TRICORE_1_8) {
-		if (vcon0 & 0x1) {
-			tricore->virt_enabled = true;
-			tricore->active_vm = vcon1 & 0xF;
-		} else {
-			tricore->virt_enabled = false;
-			/* Virt 1 (HRA) is the default*/
-			tricore->active_vm = 1;
-		}
-	}
 
 	return ERROR_OK;
 }
@@ -331,12 +376,28 @@ static int tricore_init_debug_access(struct target *target)
 		if (ret)
 			return ret;
 		tricore->virt_enabled = !!(tccon & 0x8);
+		/* Debug entry works out the VM in use; until then, the HRA */
+		tricore->active_vm = 1;
 
 		/* Enable core debug */
 		uint32_t virt_dbg_en = tricore->virt_enabled ? 0xFF0000 : 0;
 		ret = ocmts_io_write_u32(tricore->ocmts, tricore_get_reg_addr(target, TRICORE_DBGCFG), virt_dbg_en | 0x8003);
 		if (ret) {
 			LOG_TARGET_ERROR(target, "Failed to enable debug");
+			return ret;
+		}
+
+		/*
+		 * TriCore 1.8 takes the action for all debug events, triggers and
+		 * the debug instruction alike, from DBGACT, and a debug reset sets
+		 * it to "disabled". While OCDS is off, one comes with every
+		 * application reset, so after a boot without the debugger nothing
+		 * would halt the core. Halt, with suspend out, as the tools leave it.
+		 */
+		ret = ocmts_io_write_u32(tricore->ocmts, tricore_get_reg_addr(target, TRICORE_DBGACT),
+								 TRICORE_DBGACT_EVTA_HALT | TRICORE_DBGACT_SUSP);
+		if (ret) {
+			LOG_TARGET_ERROR(target, "Failed to set the debug event action");
 			return ret;
 		}
 	}
@@ -382,6 +443,7 @@ static int tricore_poll(struct target *target)
 		LOG_TARGET_ERROR(target, "Failed to read DBGSR register");
 		return ret;
 	}
+	tricore->boot_halted = bhalt;
 
 	if (tricore->dbgsr & 0x2 || bhalt) {
 		LOG_TARGET_DEBUG(target, "Target is halted DGBSR: 0x%08x BHALT: %d", tricore->dbgsr, bhalt);
@@ -401,7 +463,8 @@ static int tricore_poll(struct target *target)
 			if (ret)
 				return ret;
 		}
-	} else {
+	} else if (target->state != TARGET_DEBUG_RUNNING) {
+		/* An algorithm keeps running as one, so that it ends in DEBUG_HALTED. */
 		target->state = TARGET_RUNNING;
 	}
 
@@ -412,7 +475,20 @@ static int tricore_poll(struct target *target)
  * Issue USER() w/architecture specific status.  */
 int tricore_arch_state(struct target *target)
 {
-	return ERROR_FAIL;
+	struct tricore_info *tricore = target_to_tricore(target);
+
+	/* Not started yet: there is no reason and no meaningful PC to report. */
+	if (tricore->boot_halted && !(tricore->dbgsr & 0x2)) {
+		LOG_TARGET_USER(target, "held in boot halt");
+		return ERROR_OK;
+	}
+
+	if (!tricore->pc->valid && tricore_reg_get(tricore->pc) != ERROR_OK)
+		return ERROR_FAIL;
+
+	LOG_TARGET_USER(target, "halted due to %s, pc: 0x%08" PRIx32, debug_reason_name(target),
+					buf_get_u32(tricore->pc->value, 0, 32));
+	return ERROR_OK;
 }
 
 /* target request support */
@@ -454,9 +530,14 @@ int tricore_resume(struct target *target, bool current, target_addr_t address, b
 	}
 
 	if (current == 0) {
-		ret = tricore_reg_set(tricore->pc, (uint8_t *)&address);
-		if (ret)
+		uint8_t pc[4];
+
+		buf_set_u32(pc, 0, 32, address);
+		ret = tricore_reg_set(tricore->pc, pc);
+		if (ret) {
 			LOG_TARGET_ERROR(target, "Failed to set PC before continue");
+			return ret;
+		}
 	}
 
 	ret = tricore_restore_reg_cache(target);
@@ -491,6 +572,25 @@ int tricore_resume(struct target *target, bool current, target_addr_t address, b
 	return ERROR_OK;
 }
 
+/* Wait for DBGSR to report the core halted. */
+static int tricore_wait_halted(struct target *target, unsigned int timeout_ms)
+{
+	struct tricore_info *tricore = target_to_tricore(target);
+	int64_t start = timeval_ms();
+
+	for (;;) {
+		int ret = ocmts_io_read_u32(tricore->ocmts, tricore_get_reg_addr(target, TRICORE_DBGSR),
+									&tricore->dbgsr);
+		if (ret)
+			return ret;
+		if (tricore->dbgsr & 0x2)
+			return ERROR_OK;
+		if (timeval_ms() - start > timeout_ms)
+			return ERROR_TARGET_TIMEOUT;
+		alive_sleep(1);
+	}
+}
+
 int tricore_step(struct target *target, bool current, target_addr_t address, bool handle_breakpoints)
 {
 	struct tricore_info *tricore = target_to_tricore(target);
@@ -502,9 +602,14 @@ int tricore_step(struct target *target, bool current, target_addr_t address, boo
 	}
 
 	if (current == 0) {
-		ret = tricore_reg_set(tricore->pc, (uint8_t *)&address);
-		if (ret)
-			LOG_TARGET_ERROR(target, "Failed to set PC before continue");
+		uint8_t pc[4];
+
+		buf_set_u32(pc, 0, 32, address);
+		ret = tricore_reg_set(tricore->pc, pc);
+		if (ret) {
+			LOG_TARGET_ERROR(target, "Failed to set PC before step");
+			return ret;
+		}
 	} else {
 		ret = tricore_reg_get(tricore->pc);
 		if (ret) {
@@ -518,59 +623,73 @@ int tricore_step(struct target *target, bool current, target_addr_t address, boo
 	/* the front-end may request us not to handle breakpoints */
 	if (handle_breakpoints) {
 		breakpoint = breakpoint_find(target, address);
-		if (breakpoint)
+		if (breakpoint && breakpoint->is_set)
 			tricore_unset_breakpoint(target, breakpoint);
+		else
+			breakpoint = NULL;
 	}
 
 	ret = tricore_restore_reg_cache(target);
 	if (ret) {
 		LOG_TARGET_ERROR(target, "Failed to restore events");
-		return ret;
+		goto out;
 	}
 
 	struct breakpoint step_breakpoint = {.type = BKPT_HARD, .address = address, .length = 4};
 	ret = tricore_set_breakpoint(target, &step_breakpoint, false);
 	if (ret) {
 		LOG_TARGET_ERROR(target, "Failed to set step breakpoint");
-		return ret;
+		goto out;
 	}
 	ret = target_call_event_callbacks(target, TARGET_EVENT_RESUMED);
-	if (ret != ERROR_OK)
-		return ret;
+	if (ret != ERROR_OK) {
+		tricore_unset_breakpoint(target, &step_breakpoint);
+		goto out;
+	}
 
 	ret = ocmts_io_write_u32(tricore->ocmts, tricore_get_reg_addr(target, TRICORE_DBGSR), 0x4);
 	if (ret) {
 		LOG_TARGET_ERROR(target, "Failed to start single stepping");
-		return ret;
+		tricore_unset_breakpoint(target, &step_breakpoint);
+		goto out;
 	}
 
 	/* registers are now invalid */
 	register_cache_invalidate(target->reg_cache);
 
-	usleep(1000);
+	/* Most instructions are done at once, but one may wait for something. */
+	bool stepped = true;
+	ret = tricore_wait_halted(target, 100);
+	if (ret == ERROR_TARGET_TIMEOUT) {
+		/* Do not leave it running while it is taken as halted. */
+		LOG_TARGET_ERROR(target, "Target did not halt after step, halting it");
+		stepped = false;
+		ret = ocmts_io_write_u32(tricore->ocmts, tricore_get_reg_addr(target, TRICORE_DBGSR), 0x6);
+		if (ret == ERROR_OK)
+			ret = tricore_wait_halted(target, 1000);
+	}
 
 	tricore_unset_breakpoint(target, &step_breakpoint);
 
-	ret = ocmts_io_read_u32(tricore->ocmts, tricore_get_reg_addr(target, TRICORE_DBGSR), &tricore->dbgsr);
 	if (ret) {
-		LOG_TARGET_ERROR(target, "Failed to read DBGSR after step");
-		return ret;
-	}
-	if (tricore->dbgsr & 0x2) {
-		target->debug_reason = DBG_REASON_SINGLESTEP;
-		ret = tricore_debug_entry(target);
-		if (ret) {
-			LOG_TARGET_ERROR(target, "Failed to read debug status after step");
-			return ret;
-		}
-		ret = target_call_event_callbacks(target, TARGET_EVENT_HALTED);
-		if (ret != ERROR_OK)
-			return ret;
-	} else {
-		LOG_TARGET_ERROR(target, "Target did not halt after step");
-		return ERROR_FAIL;
+		LOG_TARGET_ERROR(target, "Failed to halt target after step");
+		target->state = TARGET_RUNNING;
+		target->debug_reason = DBG_REASON_NOTHALTED;
+		goto out;
 	}
 
+	target->debug_reason = stepped ? DBG_REASON_SINGLESTEP : DBG_REASON_DBGRQ;
+	ret = tricore_debug_entry(target);
+	if (ret) {
+		LOG_TARGET_ERROR(target, "Failed to read debug status after step");
+		goto out;
+	}
+	ret = target_call_event_callbacks(target, TARGET_EVENT_HALTED);
+	if (ret == ERROR_OK && !stepped)
+		ret = ERROR_FAIL;
+
+out:
+	/* Put back the breakpoint the step started from, whatever happened. */
 	if (breakpoint)
 		tricore_set_breakpoint(target, breakpoint, true);
 
@@ -609,12 +728,33 @@ int tricore_assert_reset(struct target *target)
 	return ERROR_OK;
 }
 
+/* Program the trigger events in use again, after a reset or the HAAR event. */
+static int tricore_restore_events(struct target *target)
+{
+	struct tricore_info *tricore = target_to_tricore(target);
+
+	for (unsigned int i = 0; i < TRICORE_NUM_EVENTS; i++) {
+		if (!tricore->events[i].enable)
+			continue;
+		int ret = tricore_event_set(target, i);
+		if (ret)
+			return ret;
+		/* the second half of a range went with the first */
+		if (tricore->events[i].compare == TRICORE_EVENT_RANGE)
+			i++;
+	}
+
+	return ERROR_OK;
+}
+
 int tricore_deassert_reset(struct target *target)
 {
 	struct tricore_info *tricore = target_to_tricore(target);
 	int ret;
 
-	if (target->coreid == 0 && target->reset_halt) {
+	bool haar = target->coreid == 0 && target->reset_halt;
+
+	if (haar) {
 		/* Set HAAR bit before releasing the reset. */
 		tricore->ocmts->ops->queue_io_set_ojconf(tricore->ocmts, 0x3);
 	}
@@ -623,9 +763,11 @@ int tricore_deassert_reset(struct target *target)
 	adapter_deassert_reset();
 
 	if (target->coreid == 0) {
-		ocmts_init(tricore->ocmts);
+		ret = ocmts_init(tricore->ocmts);
+		if (ret != ERROR_OK)
+			LOG_TARGET_WARNING(target, "OCDS not enabled after reset");
 		alive_sleep(100);
-		if (target->reset_halt) {
+		if (haar) {
 			/* Clear HAAR event after reset. */
 			ret = ocmts_io_write_block(tricore->ocmts, tricore_get_reg_addr(target, TRICORE_TRXEVT(0)),
 									   (uint32_t[]){0, 0}, 2);
@@ -642,6 +784,13 @@ int tricore_deassert_reset(struct target *target)
 	ret = tricore_init_debug_access(target);
 	if (ret != ERROR_OK)
 		return ret;
+
+	/* The breakpoints OpenOCD keeps are still wanted after the reset. */
+	ret = tricore_restore_events(target);
+	if (ret != ERROR_OK) {
+		LOG_TARGET_ERROR(target, "Failed to restore trigger events after reset");
+		return ret;
+	}
 
 	ret = tricore_poll(target);
 	if (ret != ERROR_OK)
@@ -680,6 +829,8 @@ int tricore_get_gdb_reg_list(struct target *target, struct reg **reg_list[], int
 	case REG_CLASS_GENERAL:
 		*reg_list_size = target->reg_cache->num_regs;
 		*reg_list = malloc(sizeof(struct reg *) * (*reg_list_size));
+		if (!*reg_list)
+			return ERROR_FAIL;
 
 		int i;
 		for (i = 0; i < *reg_list_size; i++)
@@ -704,6 +855,8 @@ int tricore_read_memory(struct target *target, target_addr_t address, uint32_t s
 {
 	struct tricore_info *tricore = target_to_tricore(target);
 	struct ocmts *ocmts = tricore->ocmts;
+	const target_addr_t start = address;
+	const uint32_t total = count;
 	int ret;
 
 	switch (size) {
@@ -756,8 +909,8 @@ int tricore_read_memory(struct target *target, target_addr_t address, uint32_t s
 	}
 	return ERROR_OK;
 err:
-	LOG_TARGET_ERROR(target, "Failed to read memory at 0x%08" PRIx64 "[count=%u, size=%u]", 
-			address, MIN(count, 256), size);
+	LOG_TARGET_ERROR(target, "Failed to read memory at 0x%08" PRIx64 " [count=%" PRIu32 ", size=%" PRIu32 "]",
+			start, total, size);
 	return ret;
 }
 
@@ -766,6 +919,8 @@ int tricore_write_memory(struct target *target, target_addr_t address, uint32_t 
 {
 	struct tricore_info *tricore = target_to_tricore(target);
 	struct ocmts *ocmts = tricore->ocmts;
+	const target_addr_t start = address;
+	const uint32_t total = count;
 	int ret;
 
 	switch (size) {
@@ -818,51 +973,15 @@ int tricore_write_memory(struct target *target, target_addr_t address, uint32_t 
 	return ERROR_OK;
 
 err:
-	LOG_TARGET_ERROR(target, "Failed to write memory at 0x%08" PRIx64 "[count=%u, size=%u]", address, 
-			MIN(count, 256), size);
+	LOG_TARGET_ERROR(target, "Failed to write memory at 0x%08" PRIx64 " [count=%" PRIu32 ", size=%" PRIu32 "]",
+			start, total, size);
 	return ret;
 }
 
-static const uint8_t tricore_crc_program[] = {
-#include "contrib/loaders/checksum/tricore.inc"
-};
-
 int tricore_checksum_memory(struct target *target, target_addr_t address, uint32_t count, uint32_t *checksum)
 {
-
-	int ret;
-	const size_t crc_code_size = ARRAY_SIZE(tricore_crc_program);
-
-	if (count < crc_code_size * 4) {
-		/* Don't use the algorithm for relatively small buffers. It's faster
-		 * just to read the memory.  target_checksum_memory() will take care of
-		 * that if we fail. */
-		return ERROR_FAIL;
-	}
-
-	if (0x70100000 + crc_code_size > address && 0x70100000 < address + count) {
-		LOG_TARGET_ERROR(target, "Memory range overlaps with CRC program");
-		return ERROR_FAIL;
-	}
-
-	ret = target_write_memory(target, 0x70100000, 4, ARRAY_SIZE(tricore_crc_program), tricore_crc_program);
-	if (ret) {
-		LOG_TARGET_ERROR(target, "Failed to write CRC program to target");
-		return ret;
-	}
-
-	struct reg_param reg_params[] = {
-		{.reg_name = "a4", .size = 32, .value = (uint8_t *)&address, .direction = PARAM_OUT},
-		{.reg_name = "d4", .size = 32, .value = (uint8_t *)&count, .direction = PARAM_OUT},
-		{.reg_name = "d2", .size = 32, .value = (uint8_t *)checksum, .direction = PARAM_IN},
-	};
-
-	ret = target_run_algorithm(target, 0, NULL, 3, reg_params, 0x70100000, 0, 100, NULL);
-	if (ret) {
-		LOG_TARGET_ERROR(target, "Failed to run CRC program on target");
-		return ret;
-	}
-
+	/* There is no CRC program that computes the checksum image.c expects, so
+	 * let target_checksum_memory() read the memory back instead. */
 	return ERROR_FAIL;
 }
 
@@ -931,10 +1050,11 @@ int tricore_set_breakpoint(struct target *target, struct breakpoint *breakpoint,
 
 	/* Find an available event slot */
 	for (event_id = 0; event_id < TRICORE_NUM_EVENTS; event_id++) {
-		/* For range breakpoints, need an even event ID */
+		/* For range breakpoints, need an even event ID, and the next one */
 		if (breakpoint->length > 4 && (event_id % 2 != 0))
 			continue;
-		if (!tricore->events[event_id].enable)
+		if (!tricore->events[event_id].enable &&
+			(breakpoint->length <= 4 || !tricore->events[event_id + 1].enable))
 			break;
 	}
 
@@ -1077,12 +1197,6 @@ int tricore_add_watchpoint(struct target *target, struct watchpoint *watchpoint)
 	int available_events = 0;
 	int i, ret;
 
-	/* Check if get_event is initialized */
-	if (!tricore->get_event) {
-		LOG_TARGET_ERROR(target, "Watchpoint support not fully initialized");
-		return ERROR_TARGET_RESOURCE_NOT_AVAILABLE;
-	}
-
 	/* Count available events */
 	for (i = 0; i < TRICORE_NUM_EVENTS; i++) {
 		if (!tricore->events[i].enable)
@@ -1098,7 +1212,8 @@ int tricore_add_watchpoint(struct target *target, struct watchpoint *watchpoint)
 	for (event_id = 0; event_id < TRICORE_NUM_EVENTS; event_id++) {
 		if (watchpoint->length > 4 && (event_id % 2 != 0))
 			continue;
-		if (!tricore->events[event_id].enable)
+		if (!tricore->events[event_id].enable &&
+			(watchpoint->length <= 4 || !tricore->events[event_id + 1].enable))
 			break;
 	}
 
@@ -1506,6 +1621,11 @@ int tricore_target_create(struct target *target)
 		LOG_TARGET_ERROR(target, "OCMTS not configured for target");
 		return ERROR_FAIL;
 	}
+	/* The core's registers are only reached through it. */
+	if (!target->dbgbase_set) {
+		LOG_TARGET_ERROR(target, "-dbgbase not configured for target");
+		return ERROR_FAIL;
+	}
 
 	struct tricore_info *tricore = calloc(1, sizeof(struct tricore_info));
 	if (!tricore) {
@@ -1514,6 +1634,8 @@ int tricore_target_create(struct target *target)
 	}
 	target->arch_info = tricore;
 	tricore->ocmts = pc->ocmts;
+	/* Virt 1 (HRA) is the default */
+	tricore->active_vm = 1;
 
 	return ERROR_OK;
 }
@@ -1682,6 +1804,9 @@ void tricore_deinit_target(struct target *target)
 	tricore_free_reg_cache(target);
 	free(target_to_tricore(target)->algorithm_context);
 	free(target_to_tricore(target));
+	/* From tricore_target_jim_configure(); target.c leaves it alone. */
+	free(target->private_config);
+	target->private_config = NULL;
 }
 
 /* after reset is complete, the target can check if things are properly set
@@ -1751,6 +1876,7 @@ struct target_type tricore_target = {
 
 	.add_watchpoint = tricore_add_watchpoint,
 	.remove_watchpoint = tricore_remove_watchpoint,
+	.hit_watchpoint = tricore_hit_watchpoint,
 
 	.target_create = tricore_target_create,
 

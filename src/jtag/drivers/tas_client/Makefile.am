@@ -2,7 +2,10 @@
 
 noinst_LTLIBRARIES += %D%/libocdtasclient.la
 %C%_libocdtasclient_la_SOURCES = \
+    %D%/tas_am15_am14.h \
+    %D%/tas_pkt.h \
     %D%/tas_protocol.c \
+    %D%/tas_protocol.h \
     %D%/tas_client.c
 
 TAS_CLIENT_SRC = %D%/tas_protocol.c %D%/tas_client.c
