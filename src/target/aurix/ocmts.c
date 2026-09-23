@@ -187,13 +187,21 @@ COMMAND_HANDLER(ocmts_init_cmd)
 		if (!ocmts->tap->enabled)
 			continue;
 
-		if (transport_is_ifxdap()) {
-			ocmts->ops = adapter_driver->ocmts_ops;
-			int err = ocmts->ops->connect(ocmts);
-			if (err)
-				return err;
+		/* Every access goes through the adapter's OCMTS operations, and
+		 * only the ifxdap transport provides them. */
+		if (!transport_is_ifxdap() || !adapter_driver->ocmts_ops) {
+			LOG_ERROR("OCMTS %s: the adapter provides no OCMTS access", ocmts->name);
+			return ERROR_FAIL;
 		}
-		ocmts_init(ocmts);
+
+		ocmts->ops = adapter_driver->ocmts_ops;
+		int err = ocmts->ops->connect(ocmts);
+		if (err)
+			return err;
+
+		err = ocmts_init(ocmts);
+		if (err)
+			return err;
 	}
 
 	return ERROR_OK;

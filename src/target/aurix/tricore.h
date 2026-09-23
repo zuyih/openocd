@@ -131,6 +131,8 @@ struct tricore_info {
 	bool virt_enabled;
 	bool suspended;
 	bool halted;
+	/* held in boot halt (BOOTCON/SYSCON), as of the last poll */
+	bool boot_halted;
 
 	uint32_t *algorithm_context;
 	unsigned int algorithm_context_regs;

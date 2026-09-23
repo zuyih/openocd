@@ -61,9 +61,8 @@ static inline uint32_t __attribute__((always_inline)) tc2x_flash_status(void) {
 #define FLASH_IDLE()                                                           \
   ((tc2x_flash_status() & (TC2X_BUSY_BITS | TC2X_STATUS_PROG)) ==              \
    TC2X_STATUS_PROG)
-#define FLASH_SET_PRMODE()                                                     \
-  do {                                                                         \
-  } while (0)
+#define FLASH_SET_PRMODE() 0u
+#define FLASH_RESTORE_PRMODE(config) ((void)(config))
 
 static inline uint64_t
     __attribute__((always_inline)) flash_read_timebase(void) {

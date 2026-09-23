@@ -51,4 +51,7 @@ int tas_client_session_start(struct tas_client *client, const char *device);
 int tas_client_execute_mem_req(struct tas_client *client, uint8_t addr_map, struct tas_client_mem_req *mem_req);
 int tas_client_execute_mem_reqs(struct tas_client *client, uint8_t addr_map, struct tas_client_mem_req *mem_reqs,
 								size_t mem_req_num);
+/* Most words of block data a single request can carry within the packet sizes
+ * the server allows. */
+size_t tas_client_max_block_words(const struct tas_client *client, bool is_read);
 #endif /* !OPENOCD_JTAG_DRIVERS_TAS_CLIENT_TAS_PROTOCOL_H */

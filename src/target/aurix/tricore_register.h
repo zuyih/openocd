@@ -34,6 +34,9 @@
 #define TRICORE_CREVT 0xFD0C
 #define TRICORE_SWEVT 0xFD10
 #define TRICORE_DBGACT 0xFD14
+/* TriCore 1.8 DBGACT: action on a debug event */
+#define TRICORE_DBGACT_EVTA_HALT (0x2 << 0)
+#define TRICORE_DBGACT_SUSP (1 << 4)
 #define TRICORE_TRIG_ACC 0xFD30
 #define TRICORE_DMS 0xFD40
 #define TRICORE_DCX 0xFD44

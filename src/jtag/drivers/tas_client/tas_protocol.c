@@ -204,6 +204,15 @@ int tas_client_session_start(struct tas_client *client, const char *device)
 	client->max_pl2rsp_pkt_size = MIN(max_pl2rsp_pkt_size, rsp_session_start.con_info.max_pl2rsp_pkt_size);
 	client->pl0_max_num_rw = MIN(pl0_max_num_rw, rsp_session_start.con_info.pl0_max_num_rw);
 
+	/* The buffers and the packet assembly are sized from these. */
+	if (client->max_pl2rq_pkt_size < TAS_PL2_MAX_PKT_SIZE_MIN ||
+		client->max_pl2rsp_pkt_size < TAS_PL2_MAX_PKT_SIZE_MIN || client->pl0_max_num_rw == 0) {
+		LOG_ERROR("TAS server packet limits unusable: request %" PRIu32 ", response %" PRIu32
+				  ", %" PRIu32 " accesses per packet", client->max_pl2rq_pkt_size,
+				  client->max_pl2rsp_pkt_size, client->pl0_max_num_rw);
+		return ERROR_FAIL;
+	}
+
 	return 0;
 }
 
@@ -245,16 +254,19 @@ int tas_client_device_connect(struct tas_client *client, tas_dev_con_feat_et dev
 
 int tas_client_get_targets(struct tas_client *client, tas_target_info_st **targets, size_t *target_num)
 {
-	tas_pl1rq_get_targets_st rq_get_targets;
+	tas_pl1rq_get_targets_st rq_get_targets = {
+		.wl = 0,
+		.cmd = TAS_PL1_CMD_GET_TARGETS,
+		.start_index = 0,
+		.reserved = 0,
+	};
 	tas_pl1rsp_get_targets_st rsp_get_targets;
 	uint32_t packet_size;
 	if (!targets)
 		return ERROR_FAIL;
+	*targets = NULL;
 
 	packet_size = 4 + sizeof(tas_pl1rq_get_targets_st);
-	rq_get_targets.cmd = TAS_PL1_CMD_GET_TARGETS;
-	rq_get_targets.wl = 0;
-	rq_get_targets.start_index = 0;
 
 	char buf[packet_size];
 	memcpy(buf, &packet_size, 4);
@@ -272,17 +284,29 @@ int tas_client_get_targets(struct tas_client *client, tas_target_info_st **targe
 	if (rsp_get_targets.cmd != TAS_PL1_CMD_GET_TARGETS || rsp_get_targets.err != TAS_PL_ERR_NO_ERROR)
 		return ERROR_FAIL;
 
-	*target_num = rsp_get_targets.num_target;
-	/* Limit number of targets supported */
-	if (*target_num > 32)
+	/* The packet lists num_now of the num_target devices attached. */
+	*target_num = rsp_get_targets.num_now;
+	if (*target_num > rsp_get_targets.num_target ||
+		packet_size != 4 + sizeof(rsp_get_targets) + *target_num * sizeof(tas_target_info_st)) {
+		LOG_ERROR("TAS target list malformed");
 		return ERROR_FAIL;
+	}
+	if (*target_num < rsp_get_targets.num_target)
+		LOG_WARNING("TAS server lists only %zu of %u attached devices", *target_num,
+					rsp_get_targets.num_target);
 	if (*target_num > 0) {
 		*targets = calloc(*target_num, sizeof(tas_target_info_st));
 		if (!*targets)
 			return ERROR_FAIL;
 		if (recv_exact(client->sock, *targets, *target_num * sizeof(tas_target_info_st)) !=
-			(int)(*target_num * sizeof(tas_target_info_st)))
+			(int)(*target_num * sizeof(tas_target_info_st))) {
+			free(*targets);
+			*targets = NULL;
 			return ERROR_FAIL;
+		}
+		/* The identifiers are printed and compared as strings. */
+		for (size_t i = 0; i < *target_num; i++)
+			(*targets)[i].identifier[sizeof((*targets)[i].identifier) - 1] = '\0';
 	}
 
 	return ERROR_OK;
@@ -322,6 +346,76 @@ enum {
 };
 
 static uint16_t pl1_count;
+
+/* Answers to earlier packets that a failed request left in the stream, which
+ * a later request steps over, at most. */
+#define TAS_STALE_RSP_MAX 64
+
+/* Byte and halfword accesses, or whole words up to 1 KiB. */
+static bool tas_client_mem_req_valid(const struct tas_client_mem_req *req)
+{
+	return req->length == 1 || req->length == 2 ||
+		(req->length % 4 == 0 && req->length > 0 && req->length <= 1024);
+}
+
+/* The PL0 command for a request. */
+static uint8_t tas_client_pl0_cmd(const struct tas_client_mem_req *req)
+{
+	switch (req->length) {
+	case 1:
+		return req->is_read ? TAS_PL0_CMD_RD8 : TAS_PL0_CMD_WR8;
+	case 2:
+		return req->is_read ? TAS_PL0_CMD_RD16 : TAS_PL0_CMD_WR16;
+	case 4:
+		return req->is_read ? TAS_PL0_CMD_RD32 : TAS_PL0_CMD_WR32;
+	case 8:
+		return req->is_read ? TAS_PL0_CMD_RD64 : TAS_PL0_CMD_WR64;
+	default:
+		return req->is_read ? TAS_PL0_CMD_RDBLK : TAS_PL0_CMD_WRBLK;
+	}
+}
+
+/* The command a successful response carries: that of the request, except
+ * for a read of a whole 1 KiB. */
+static uint8_t tas_client_pl0_rsp_cmd(const struct tas_client_mem_req *req)
+{
+	if (req->is_read && req->length == 1024)
+		return TAS_PL0_CMD_RDBLK1KB;
+	return tas_client_pl0_cmd(req);
+}
+
+/*
+ * Receive the next PL0 response into @a rx_buffer, without its length word.
+ * Its length is checked before anything is read into the buffer, and one
+ * that no PL0 response can have ends the request: the stream can no longer
+ * be split into packets.
+ */
+static int tas_client_recv_pl0_rsp(struct tas_client *client, char *rx_buffer, uint32_t *recv_len)
+{
+	uint32_t len;
+
+	if (recv_exact(client->sock, &len, 4) != 4)
+		return ERROR_FAIL;
+	if (len > client->max_pl2rsp_pkt_size ||
+		len < 4 + sizeof(tas_pl1rsp_pl0_start_st) + sizeof(tas_pl1rsp_pl0_end_st)) {
+		LOG_ERROR("TAS response size %" PRIu32 " out of range", len);
+		return ERROR_FAIL;
+	}
+	if (recv_exact(client->sock, rx_buffer, len - 4) != (int)(len - 4))
+		return ERROR_FAIL;
+
+	*recv_len = len;
+	return ERROR_OK;
+}
+
+/* The packet counter a PL0 response answers, from its end record. */
+static uint16_t tas_client_rsp_pl1_cnt(const char *rx_buffer, uint32_t recv_len)
+{
+	tas_pl1rsp_pl0_end_st rsp_end;
+
+	memcpy(&rsp_end, rx_buffer + recv_len - 4 - sizeof(rsp_end), sizeof(rsp_end));
+	return rsp_end.pl1_cnt;
+}
 
 struct tas_client_pl0_req {
 	uint32_t addr;
@@ -483,6 +577,11 @@ int tas_client_execute_mem_req(struct tas_client *client, uint8_t addr_map, stru
 				  client->max_pl2rsp_pkt_size);
 		return ERROR_FAIL;
 	}
+	/* Below, packet_size - 4 must not wrap around. */
+	if (packet_size < 4 + sizeof(tas_pl1rsp_pl0_start_st) + sizeof(tas_pl1rsp_pl0_end_st)) {
+		LOG_DEBUG("Response packet size %u too short", packet_size);
+		return ERROR_FAIL;
+	}
 	err = recv_exact(client->sock, rx_buf, packet_size - 4);
 	if (err != (int)packet_size - 4)
 		return ERROR_FAIL;
@@ -524,6 +623,34 @@ int tas_client_execute_mem_req(struct tas_client *client, uint8_t addr_map, stru
 	return ERROR_OK;
 }
 
+/* Read and drop the responses to @a pending packets. */
+static void tas_client_drain(struct tas_client *client, char *rx_buffer, size_t pending)
+{
+	while (pending--) {
+		uint32_t len;
+
+		if (recv_exact(client->sock, &len, 4) != 4 || len < 4 || len > client->max_pl2rsp_pkt_size)
+			return;
+		if (recv_exact(client->sock, rx_buffer, len - 4) != (int)(len - 4))
+			return;
+	}
+}
+
+size_t tas_client_max_block_words(const struct tas_client *client, bool is_read)
+{
+	/* A block request alone in a packet, laid out as in
+	 * tas_client_execute_mem_reqs(). */
+	size_t overhead = is_read ?
+		4 + sizeof(tas_pl1rsp_pl0_start_st) + sizeof(tas_pl0rsp_rd_st) + sizeof(tas_pl1rsp_pl0_end_st) :
+		4 + sizeof(tas_pl1rq_pl0_start_st) + sizeof(tas_pl0rq_addr_map_st) + sizeof(tas_pl0rq_base_addr32_st) +
+			sizeof(tas_pl0rq_wrblk_st) + sizeof(tas_pl1rq_pl0_end_st);
+	size_t limit = is_read ? client->max_pl2rsp_pkt_size : client->max_pl2rq_pkt_size;
+
+	if (limit <= overhead)
+		return 0;
+	return MIN((limit - overhead) / 4, 256);
+}
+
 int tas_client_execute_mem_reqs(struct tas_client *client, uint8_t addr_map, struct tas_client_mem_req *mem_reqs,
 								size_t mem_req_num)
 {
@@ -534,7 +661,16 @@ int tas_client_execute_mem_reqs(struct tas_client *client, uint8_t addr_map, str
 	size_t recv_mem_req = 0;
 	struct tas_outstanding_pkt outstanding[TAS_OUTSTANDING_MAX] = {0};
 	size_t outstanding_num = 0;
+	unsigned int stale = 0;
 	uint8_t con_id = 0;
+
+	/* All of them, before anything is on its way. */
+	for (size_t i = 0; i < mem_req_num; i++) {
+		if (!tas_client_mem_req_valid(&mem_reqs[i])) {
+			LOG_ERROR("TAS request of %zu bytes not supported", mem_reqs[i].length);
+			return ERROR_FAIL;
+		}
+	}
 
 	while (recv_mem_req < mem_req_num) {
 		while (send_mem_req < mem_req_num && outstanding_num < TAS_OUTSTANDING_MAX) {
@@ -579,12 +715,14 @@ int tas_client_execute_mem_reqs(struct tas_client *client, uint8_t addr_map, str
 
 			for (i = send_mem_req; i < mem_req_num && rq_end.num_pl0_rw < client->pl0_max_num_rw;
 				 i++, rq_end.num_pl0_rw++) {
-				if (mem_reqs[i].length != 1 && mem_reqs[i].length != 2 && mem_reqs[i].length != 4 &&
-					mem_reqs[i].length != 8 && mem_reqs[i].length % 4 != 0 && mem_reqs[i].length > 1024)
-					return ERROR_FAIL;
 				uint32_t words = (mem_reqs[i].length + 3) / 4;
-				if (tx_offset + sizeof(tas_pl0rq_base_addr32_st) +
-							(mem_reqs[i].is_read ? sizeof(tas_pl0rq_rd_st) : sizeof(tas_pl0rq_wrblk_st) + words * 4) >
+				uint8_t cmd = tas_client_pl0_cmd(&mem_reqs[i]);
+				/* What the request adds, as it is laid out below, and the end
+				 * record that still has to fit behind it. */
+				size_t rq_size = mem_reqs[i].is_read ?
+					(mem_reqs[i].length > 8 ? sizeof(tas_pl0rq_rdblk_st) : sizeof(tas_pl0rq_rd_st)) :
+					sizeof(tas_pl0rq_wrblk_st) + words * 4;
+				if (tx_offset + sizeof(tas_pl0rq_base_addr32_st) + rq_size + sizeof(rq_end) >
 						client->max_pl2rq_pkt_size ||
 					rx_size + (mem_reqs[i].is_read ? sizeof(tas_pl0rsp_rd_st) + words * 4 : sizeof(tas_pl0rsp_st)) >
 						client->max_pl2rsp_pkt_size)
@@ -603,11 +741,7 @@ int tas_client_execute_mem_reqs(struct tas_client *client, uint8_t addr_map, str
 
 				if (mem_reqs[i].is_read) {
 					tas_pl0rq_rdblk_st pl0rq_read = {
-						.cmd = (mem_reqs[i].length == 1)   ? TAS_PL0_CMD_RD8
-							   : (mem_reqs[i].length == 2) ? TAS_PL0_CMD_RD16
-							   : (mem_reqs[i].length == 4) ? TAS_PL0_CMD_RD32
-							   : (mem_reqs[i].length == 8) ? TAS_PL0_CMD_RD64
-														   : TAS_PL0_CMD_RDBLK,
+						.cmd = cmd,
 						.wl = (mem_reqs[i].length > 8) ? 1 : 0,
 						.a15to0 = mem_reqs[i].addr & 0xFFFF,
 						.wlrd = (mem_reqs[i].length == 1024) ? 0 : words,
@@ -622,23 +756,27 @@ int tas_client_execute_mem_reqs(struct tas_client *client, uint8_t addr_map, str
 					rx_size += sizeof(tas_pl0rsp_rd_st) + words * 4;
 				} else {
 					tas_pl0rq_wrblk_st pl0rq_write = {
-						.cmd = (mem_reqs[i].length == 1)   ? TAS_PL0_CMD_WR8
-							   : (mem_reqs[i].length == 2) ? TAS_PL0_CMD_WR16
-							   : (mem_reqs[i].length == 4) ? TAS_PL0_CMD_WR32
-							   : (mem_reqs[i].length == 8) ? TAS_PL0_CMD_WR64
-														   : TAS_PL0_CMD_WRBLK,
+						.cmd = cmd,
 						.wl = (mem_reqs[i].length == 1024) ? 0 : words,
 						.a15to0 = mem_reqs[i].addr & 0xFFFF,
 					};
 					memcpy(tx_buffer + tx_offset, &pl0rq_write, sizeof(pl0rq_write));
 					tx_offset += sizeof(pl0rq_write);
+					/* Data goes in whole words; pad a byte or halfword. */
 					memcpy(tx_buffer + tx_offset, mem_reqs[i].buffer, mem_reqs[i].length);
+					memset(tx_buffer + tx_offset + mem_reqs[i].length, 0, words * 4 - mem_reqs[i].length);
 					tx_offset += words * 4;
 					rx_size += sizeof(tas_pl0rsp_st);
 				}
 			}
 
-			assert(rq_end.num_pl0_rw != 0);
+			if (rq_end.num_pl0_rw == 0) {
+				/* The queue splits blocks to fit a packet, see
+				 * tas_client_max_block_words(). */
+				LOG_ERROR("TAS request of %zu bytes does not fit a packet", mem_reqs[send_mem_req].length);
+				tas_client_drain(client, rx_buffer, outstanding_num);
+				return ERROR_FAIL;
+			}
 
 			memcpy(tx_buffer + tx_offset, &rq_end, sizeof(rq_end));
 			tx_offset += sizeof(rq_end);
@@ -662,65 +800,80 @@ int tas_client_execute_mem_reqs(struct tas_client *client, uint8_t addr_map, str
 			return ERROR_FAIL;
 
 		uint32_t recv_len;
-		err = recv_exact(client->sock, &recv_len, 4);
-		if (err != 4)
-			return ERROR_FAIL;
-		if (recv_len > client->max_pl2rsp_pkt_size) {
-			LOG_DEBUG("TAS response size too long %d", recv_len);
-			return ERROR_FAIL;
-		}
-		err = recv_exact(client->sock, rx_buffer, recv_len - 4);
-		if (err != (int)recv_len - 4)
-			return ERROR_FAIL;
+		err = tas_client_recv_pl0_rsp(client, rx_buffer, &recv_len);
+		if (err)
+			return err;
 
 		size_t rx_offset = 0;
+		/* Where the data of the response ends and its end record begins. */
+		size_t rx_end = recv_len - 4 - sizeof(tas_pl1rsp_pl0_end_st);
+		uint16_t rsp_pl1_cnt = tas_client_rsp_pl1_cnt(rx_buffer, recv_len);
 		tas_pl1rsp_pl0_start_st rsp_start;
-		tas_pl1rsp_pl0_end_st rsp_end;
 		memcpy(&rsp_start, rx_buffer + rx_offset, sizeof(rsp_start));
 		rx_offset += sizeof(rsp_start);
-		memcpy(&rsp_end, rx_buffer + recv_len - 4 - sizeof(rsp_end), sizeof(rsp_end));
 
 		size_t slot = TAS_OUTSTANDING_MAX;
 		for (size_t i = 0; i < TAS_OUTSTANDING_MAX; i++) {
 			if (!outstanding[i].in_use)
 				continue;
-			if (outstanding[i].pl1_cnt == rsp_end.pl1_cnt) {
+			if (outstanding[i].pl1_cnt == rsp_pl1_cnt) {
 				slot = i;
 				break;
 			}
 		}
 		if (slot == TAS_OUTSTANDING_MAX) {
-			LOG_DEBUG("TAS response pl1_cnt unmatched in mem batch: rsp_end.pl1_cnt=0x%04x", rsp_end.pl1_cnt);
-			return ERROR_FAIL;
+			/* An answer to a packet of an earlier, failed request: ours are
+			 * still to come. */
+			if (stale++ == TAS_STALE_RSP_MAX) {
+				LOG_ERROR("TAS responses to this request missing");
+				tas_client_drain(client, rx_buffer, outstanding_num);
+				return ERROR_FAIL;
+			}
+			LOG_DEBUG("Dropping stale TAS response, pl1_cnt=0x%04" PRIx16, rsp_pl1_cnt);
+			continue;
 		}
 		if (recv_len > outstanding[slot].expected_rx_size) {
-			LOG_DEBUG("TAS unexpected response size %zu != %d", outstanding[slot].expected_rx_size, recv_len);
-			return ERROR_FAIL;
+			LOG_DEBUG("TAS unexpected response size %zu != %" PRIu32, outstanding[slot].expected_rx_size, recv_len);
+			goto drain;
 		}
 		if (rsp_start.err != TAS_PL_ERR_NO_ERROR) {
 			LOG_ERROR("TAS PL1 error: %s ", tas_pl_err_to_str(rsp_start.err));
-			return ERROR_FAIL;
+			goto drain;
 		}
 
 		bool pl0_error = false;
 		for (size_t i = outstanding[slot].start_mem_req; i < outstanding[slot].end_mem_req; i++) {
 			tas_pl0rsp_st rsp_pl0;
+			/* Data comes in whole words, also for a byte or a halfword. */
+			size_t data = mem_reqs[i].is_read ? (mem_reqs[i].length + 3) / 4 * 4 : 0;
+
+			if (rx_offset + sizeof(rsp_pl0) > rx_end) {
+				LOG_ERROR("TAS response too short for its requests");
+				pl0_error = true;
+				break;
+			}
 			memcpy(&rsp_pl0, rx_buffer + rx_offset, sizeof(rsp_pl0));
 			rx_offset += sizeof(rsp_pl0);
 			if (rsp_pl0.err != TAS_PL0_ERR_NO_ERROR) {
 				LOG_ERROR("TAS PL0 mem request failed: %s (addr=0x%08" PRIx32 " len=%zu is_read=%u)",
-						tas_pl_err_to_str(rsp_pl0.err), mem_reqs[i].addr, mem_reqs[i].length, 
+						tas_pl_err_to_str(rsp_pl0.err), mem_reqs[i].addr, mem_reqs[i].length,
 						mem_reqs[i].is_read ? 1 : 0);
 				pl0_error = true;
-			} else {
-				if (mem_reqs[i].is_read) {
-					memcpy(mem_reqs[i].buffer, rx_buffer + rx_offset, mem_reqs[i].length);
-					rx_offset += mem_reqs[i].length;
-				}
+				continue;
+			}
+			if (rsp_pl0.cmd != tas_client_pl0_rsp_cmd(&mem_reqs[i]) || rx_offset + data > rx_end) {
+				LOG_ERROR("TAS response does not match request (addr=0x%08" PRIx32 " cmd=0x%02x rsp_cmd=0x%02x)",
+						mem_reqs[i].addr, tas_client_pl0_rsp_cmd(&mem_reqs[i]), rsp_pl0.cmd);
+				pl0_error = true;
+				break;
+			}
+			if (mem_reqs[i].is_read) {
+				memcpy(mem_reqs[i].buffer, rx_buffer + rx_offset, mem_reqs[i].length);
+				rx_offset += data;
 			}
 		}
 		if (pl0_error)
-			return ERROR_FAIL;
+			goto drain;
 
 		outstanding[slot].in_use = false;
 		outstanding_num--;
@@ -728,4 +881,10 @@ int tas_client_execute_mem_reqs(struct tas_client *client, uint8_t addr_map, str
 	}
 
 	return ERROR_OK;
+
+drain:
+	/* The answers to the packets still outstanding are on their way. Read
+	 * them now, or the next request would take one of them for its own. */
+	tas_client_drain(client, rx_buffer, outstanding_num - 1);
+	return ERROR_FAIL;
 }

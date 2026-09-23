@@ -164,17 +164,17 @@ static int tc2x_eflash_set_bank(struct flash_bank *bank, struct aurix_eflash_ban
 {
 	static const struct aurix_eflash_bank_info tc27x_layout[] = {
 		{AURIX_EFLASH_PFLASH, 0x80000000, 2 * 1024 * 1024, 512 * 1024, 3, false},
-		{AURIX_EFLASH_PFLASH, 0x80200000, 2 * 1024 * 1024, 521 * 1024, 4, false},
-		{AURIX_EFLASH_DFLASH, 0xAF000000, 348 * 1024, 348 * 1024, 0, false},
+		{AURIX_EFLASH_PFLASH, 0x80200000, 2 * 1024 * 1024, 512 * 1024, 4, false},
+		{AURIX_EFLASH_DFLASH, 0xAF000000, 384 * 1024, 384 * 1024, 0, false},
 		{AURIX_EFLASH_UCB, 0xAF100000, 16 * 1024, 16 * 1024, 0, false},
 		{AURIX_EFLASH_DFLASH, 0xAF110000, 64 * 1024, 64 * 1024, 1, true},
 	};
 	static const struct aurix_eflash_bank_info tc29x_layout[] = {
 		{AURIX_EFLASH_PFLASH, 0x80000000, 2 * 1024 * 1024, 512 * 1024, 3, false},
-		{AURIX_EFLASH_PFLASH, 0x80200000, 2 * 1024 * 1024, 521 * 1024, 4, false},
+		{AURIX_EFLASH_PFLASH, 0x80200000, 2 * 1024 * 1024, 512 * 1024, 4, false},
 		{AURIX_EFLASH_PFLASH, 0x80400000, 2 * 1024 * 1024, 512 * 1024, 5, false},
-		{AURIX_EFLASH_PFLASH, 0x80600000, 2 * 1024 * 1024, 521 * 1024, 6, false},
-		{AURIX_EFLASH_DFLASH, 0xAF000000, 768 * 1024, 348 * 1024, 0, false},
+		{AURIX_EFLASH_PFLASH, 0x80600000, 2 * 1024 * 1024, 512 * 1024, 6, false},
+		{AURIX_EFLASH_DFLASH, 0xAF000000, 768 * 1024, 384 * 1024, 0, false},
 		{AURIX_EFLASH_UCB, 0xAF100000, 16 * 1024, 16 * 1024, 0, false},
 		{AURIX_EFLASH_DFLASH, 0xAF110000, 64 * 1024, 64 * 1024, 1, true},
 	};
@@ -212,7 +212,9 @@ static int tc2x_eflash_set_bank(struct flash_bank *bank, struct aurix_eflash_ban
 	return ERROR_OK;
 }
 
-size_t tc2x_eflash_get_pflash_sector_count(struct flash_bank *bank, size_t start_sector, size_t end_sector) {
+static size_t tc2x_eflash_get_pflash_sector_count(struct flash_bank *bank, size_t start_sector,
+		size_t end_sector)
+{
 	size_t i = 0;
 	for (i = start_sector; i <= end_sector; i++) {
 		if (i + 1 == bank->num_sectors) {
@@ -523,6 +525,8 @@ static int tc2x_eflash_probe(struct flash_bank *bank)
 	bank->num_sectors = tc2x_bank->type == AURIX_EFLASH_PFLASH ?
 		ARRAY_SIZE(pflash_sector_sizes) : bank->size / tc2x_bank->params.sector_size;
 	bank->sectors = calloc(bank->num_sectors, sizeof(struct flash_sector));
+	if (!bank->sectors)
+		return ERROR_FAIL;
 
 	unsigned int sector;
 	for (sector = 0; sector < bank->num_sectors && bank_offset < bank->size; sector++) {
@@ -581,6 +585,8 @@ static int tc3x_eflash_probe(struct flash_bank *bank)
 	bank->write_end_alignment = tc3x_bank->params.burst_size;
 	bank->num_sectors = bank->size / tc3x_bank->params.sector_size;
 	bank->sectors = calloc(bank->num_sectors, sizeof(struct flash_sector));
+	if (!bank->sectors)
+		return ERROR_FAIL;
 	for (unsigned int i = 0; i < bank->num_sectors; i++) {
 		bank->sectors[i].size = tc3x_bank->params.sector_size;
 		bank->sectors[i].offset = flash_addr - bank->base;
@@ -631,6 +637,8 @@ static int tc4x_eflash_probe(struct flash_bank *bank)
 	bank->write_end_alignment = tc4x_bank->params.burst_size;
 	bank->num_sectors = bank->size / tc4x_bank->params.sector_size;
 	bank->sectors = calloc(bank->num_sectors, sizeof(struct flash_sector));
+	if (!bank->sectors)
+		return ERROR_FAIL;
 	for (unsigned int i = 0; i < bank->num_sectors; i++) {
 		bank->sectors[i].size = tc4x_bank->params.sector_size;
 		bank->sectors[i].offset = flash_addr - bank->base;
@@ -699,13 +707,15 @@ static inline void aurix_eflash_get_error_string_tc4x(uint32_t flash_err, char *
 		strcat(err_str, " Program verify error");
 	if (flash_err & (1 << 7))
 		strcat(err_str, " Erase verify error");
-	if (flash_err & (1 << 8))
+	if (flash_err & (1 << 16))
 		strcat(err_str, " Flash operation error");
+	if (flash_err & (1 << 17))
+		strcat(err_str, " Original Error");
 	if (flash_err & (1 << 29))
 		strcat(err_str, " No page mode entry");
-	if (flash_err & (1 << 30))
+	if (flash_err & (1u << 30))
 		strcat(err_str, " Flash operation timeout");
-	if (flash_err & (1 << 31))
+	if (flash_err & (1u << 31))
 		strcat(err_str, " Flash busy");
 }
 
@@ -725,9 +735,11 @@ static inline void aurix_eflash_get_error_string_tc3x(uint32_t flash_err, char *
 		strcat(err_str, " SRI Bus Address ECC Error");
 	if (flash_err & (1 << 6))
 		strcat(err_str, " Original Error");
-	if (flash_err & (1 << 30))
+	if (flash_err & (1 << 29))
+		strcat(err_str, " No page mode entry");
+	if (flash_err & (1u << 30))
 		strcat(err_str, " Flash operation timeout");
-	if (flash_err & (1 << 31))
+	if (flash_err & (1u << 31))
 		strcat(err_str, " Flash busy");
 }
 
@@ -743,9 +755,11 @@ static inline void aurix_eflash_get_error_string_tc2x(uint32_t flash_err, char *
 		strcat(err_str, " Program verify error");
 	if (flash_err & (1 << 26))
 		strcat(err_str, " Erase verify error");
-	if (flash_err & (1 << 30))
+	if (flash_err & (1 << 29))
+		strcat(err_str, " No page mode entry");
+	if (flash_err & (1u << 30))
 		strcat(err_str, " Flash operation timeout");
-	if (flash_err & (1 << 31))
+	if (flash_err & (1u << 31))
 		strcat(err_str, " Flash busy");
 }
 
@@ -788,7 +802,7 @@ status_err:
 		if (aurix_bank->family == AURIX_EFLASH_TC2X)
 			flash_err &= TC2X_FLASH_ERROR_MASK;
 		if (aurix_bank->family == AURIX_EFLASH_TC4X) {
-			if ((flash_busy & ((1 << 31) | (1 << 30))) == 0xC0000000 &&
+			if ((flash_busy & ((1u << 31) | (1u << 30))) == 0xC0000000 &&
 					!(flash_busy & (1 << aurix_bank->params.busy_bit))) {
 				timeout_occurred = false;
 				break;
@@ -803,7 +817,7 @@ status_err:
 	}
 
 	if (timeout_occurred) {
-		flash_err |= (1 << 30);
+		flash_err |= (1u << 30);
 	}
 
 	if (flash_err) {
@@ -811,7 +825,7 @@ status_err:
 							: aurix_bank->family == AURIX_EFLASH_TC2X ? 26
 																	  : 4;
 		uint32_t faltal_mask =
-				aurix_bank->family == AURIX_EFLASH_TC4X   ? ((1 << 8) | (1 << 5))
+				aurix_bank->family == AURIX_EFLASH_TC4X   ? ((1 << 16) | (1 << 5))
 				: aurix_bank->family == AURIX_EFLASH_TC2X ? (1 << 11)
                                                         : (1 << 0);
 		if (verify_error) {
@@ -830,7 +844,7 @@ status_err:
 		if (flash_err & faltal_mask) {
 			LOG_ERROR("Critical flash error. Please reset device to continue");
 		} else if (flash_err & (aurix_bank->family == AURIX_EFLASH_TC2X ?
-				((1 << 11) | (1 << 12)) : ((1 << 1) | (1 << 2)))) {
+				((1 << 12) | (1 << 13)) : ((1 << 1) | (1 << 2)))) {
 			ret = aurix_eflash_reset_to_read(bank);
 		} else {
 			ret = aurix_eflash_clear_status(bank);
@@ -907,7 +921,7 @@ err:
 	return ret;
 }
 
-int aurix_eflash_erase(struct flash_bank *bank, unsigned int first, unsigned int last)
+static int aurix_eflash_erase(struct flash_bank *bank, unsigned int first, unsigned int last)
 {
 	struct aurix_eflash_bank *aurix_bank = bank->driver_priv;
 	struct ocmts *ocmts = target_to_tricore(bank->target)->ocmts;
@@ -926,8 +940,9 @@ int aurix_eflash_erase(struct flash_bank *bank, unsigned int first, unsigned int
 	}
 
 	if (aurix_bank->type == AURIX_EFLASH_UCB && aurix_bank->ucb_unlocked == false) {
-		LOG_WARNING("UCB bank has not been unlocked. Skipping operation.");
-		return ERROR_OK;
+		/* Skipping quietly would let the caller take the UCB as written. */
+		LOG_ERROR("Writing the user configuration blocks is not supported");
+		return ERROR_FLASH_OPER_UNSUPPORTED;
 	}
 
 	if (bank->target->state != TARGET_HALTED) {
@@ -1027,7 +1042,7 @@ sequence_err:
 	return ERROR_OK;
 }
 
-int aurix_eflash_erase_check(struct flash_bank *bank)
+static int aurix_eflash_erase_check(struct flash_bank *bank)
 {
 	struct aurix_eflash_bank *aurix_bank = bank->driver_priv;
 	struct ocmts *ocmts = target_to_tricore(bank->target)->ocmts;
@@ -1302,7 +1317,11 @@ static int aurix_eflash_write_algo(struct flash_bank *bank, uint32_t address, co
 		uint32_t status = buf_get_u32(reg_params[4].value, 0, 32);
 		char err_str[256] = {0};
 		aurix_eflash_get_error_string(aurix_bank, status, err_str);
-		LOG_ERROR("Flash algorithm failed: %s", err_str);
+		/* The loader's own, see contrib/loaders/flash/aurix/aurix-flash-program.c.
+		 * Its other codes share bits with the flash error registers. */
+		if (status & (1u << 28))
+			strcat(err_str, " Safety ENDINIT could not be changed");
+		LOG_ERROR("Flash algorithm failed, status 0x%08" PRIx32 ":%s", status, err_str);
 	}
 	target_free_working_area(target, source);
 
@@ -1332,8 +1351,9 @@ static int aurix_eflash_write(struct flash_bank *bank, const uint8_t *buffer, ui
 	}
 
 	if (aurix_bank->type == AURIX_EFLASH_UCB && aurix_bank->ucb_unlocked == false) {
-		LOG_WARNING("UCB bank has not been unlocked. Skipping operation.");
-		return ERROR_OK;
+		/* Skipping quietly would let the caller take the UCB as written. */
+		LOG_ERROR("Writing the user configuration blocks is not supported");
+		return ERROR_FLASH_OPER_UNSUPPORTED;
 	}
 
 	if (bank->target->state != TARGET_HALTED) {
