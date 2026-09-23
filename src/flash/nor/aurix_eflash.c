@@ -101,6 +101,7 @@ static uint32_t page_mode_d_key = 0x5D;
 
 #define TC2X_FLASH_ERROR_MASK ((1u << 11) | (1u << 12) | (1u << 13) | (1u << 25) | (1u << 26))
 #define TC2X_WDTS_CON0 0xF00360F0
+#define TC3X_WDTS_CON0 0xF00362A8
 
 struct aurix_eflash_bank_info {
 	enum aurix_eflash_type type;
@@ -691,6 +692,43 @@ static inline uint32_t tc2x_eflash_wdt_set_endinit(uint32_t wdts_con0, uint32_t 
 	return (wdts_con0 & 0xFFFFFF00u) | (~wdts_con0 & 0xFCu) | 0x02u | endinit;
 }
 
+/*
+ * Safety WDT CON0 where the flash refuses commands with a protection error
+ * while the Safety ENDINIT is set: TC2x PFLASH, and on TC3x, as in iLLD,
+ * PFLASH and DFLASH alike. Both take the password sequence above. 0 where the
+ * watchdog is left alone.
+ */
+static target_addr_t aurix_eflash_safety_wdt(const struct aurix_eflash_bank *aurix_bank)
+{
+	if (aurix_bank->family == AURIX_EFLASH_TC2X && aurix_bank->type == AURIX_EFLASH_PFLASH)
+		return TC2X_WDTS_CON0;
+	if (aurix_bank->family == AURIX_EFLASH_TC3X)
+		return TC3X_WDTS_CON0;
+	return 0;
+}
+
+/* TC3x startup code leaves the Safety ENDINIT set, but out of reset it is
+ * clear, and then it is left alone. */
+static bool aurix_eflash_endinit_guard(const struct aurix_eflash_bank *aurix_bank, uint32_t wdts_con0)
+{
+	if (aurix_bank->family == AURIX_EFLASH_TC3X)
+		return wdts_con0 & 1;
+	return true;
+}
+
+/*
+ * Set Safety ENDINIT again after a command sequence failed on its way: the
+ * part that cleared it may have run, and left clear, the safety watchdog
+ * times out.
+ */
+static void aurix_eflash_endinit_restore(struct ocmts *ocmts, target_addr_t wdts, uint32_t wdt_unlock,
+		uint32_t endinit_set)
+{
+	if (ocmts_io_write_u32(ocmts, wdts, wdt_unlock) != ERROR_OK ||
+		ocmts_io_write_u32(ocmts, wdts, endinit_set) != ERROR_OK)
+		LOG_WARNING("Failed to set Safety ENDINIT again, the safety watchdog may time out");
+}
+
 static inline void aurix_eflash_get_error_string_tc4x(uint32_t flash_err, char *err_str)
 {
 	if (flash_err & (1 << 0))
@@ -926,14 +964,17 @@ static int aurix_eflash_erase(struct flash_bank *bank, unsigned int first, unsig
 	struct aurix_eflash_bank *aurix_bank = bank->driver_priv;
 	struct ocmts *ocmts = target_to_tricore(bank->target)->ocmts;
 	uint32_t wdts_con0 = 0, wdt_unlock = 0, endinit_clear = 0, endinit_set = 0;
+	const target_addr_t wdts = aurix_eflash_safety_wdt(aurix_bank);
+	bool endinit_guard = false;
 	int ret;
 
-	if (aurix_bank->family == AURIX_EFLASH_TC2X && aurix_bank->type == AURIX_EFLASH_PFLASH) {
-		ret = ocmts_io_read_u32(ocmts, TC2X_WDTS_CON0, &wdts_con0);
+	if (wdts) {
+		ret = ocmts_io_read_u32(ocmts, wdts, &wdts_con0);
 		if (ret) {
-			LOG_ERROR("Failed to read TC2X watchdog control register");
+			LOG_ERROR("Failed to read safety watchdog control register");
 			return ret;
 		}
+		endinit_guard = aurix_eflash_endinit_guard(aurix_bank, wdts_con0);
 		wdt_unlock = tc2x_eflash_wdt_unlock(wdts_con0);
 		endinit_clear = tc2x_eflash_wdt_set_endinit(wdts_con0, 0);
 		endinit_set = tc2x_eflash_wdt_set_endinit(wdts_con0, 1);
@@ -980,17 +1021,17 @@ static int aurix_eflash_erase(struct flash_bank *bank, unsigned int first, unsig
 			sector_count = MIN(aurix_bank->params.num_erase_sectors, MIN(last - first + 1, sectors_to_boundary));
 		}
 
-		if (aurix_bank->family == AURIX_EFLASH_TC2X && aurix_bank->type == AURIX_EFLASH_PFLASH) {
-			ret = ocmts_queue_write_u32(ocmts, TC2X_WDTS_CON0, &wdt_unlock);
+		/* Put address always in segment 0xA */
+		uint32_t addr = (~0xF0000000 & (bank->base + bank->sectors[first].offset)) + 0xA0000000;
+
+		if (endinit_guard) {
+			ret = ocmts_queue_write_u32(ocmts, wdts, &wdt_unlock);
 			if (ret)
 				goto sequence_err;
-			ret = ocmts_queue_write_u32(ocmts, TC2X_WDTS_CON0, &endinit_clear);
+			ret = ocmts_queue_write_u32(ocmts, wdts, &endinit_clear);
 			if (ret)
 				goto sequence_err;
 		}
-
-		/* Put address always in segment 0xA */
-		uint32_t addr = (~0xF0000000 & (bank->base + bank->sectors[first].offset)) + 0xA0000000;
 
 		ret = ocmts_queue_write_u32(ocmts, aurix_bank->cmd_addr + 0xAA50, &addr);
 		if (ret)
@@ -1005,11 +1046,11 @@ static int aurix_eflash_erase(struct flash_bank *bank, unsigned int first, unsig
 		if (ret)
 			goto sequence_err;
 
-		if (aurix_bank->family == AURIX_EFLASH_TC2X && aurix_bank->type == AURIX_EFLASH_PFLASH) {
-			ret = ocmts_queue_write_u32(ocmts, TC2X_WDTS_CON0, &wdt_unlock);
+		if (endinit_guard) {
+			ret = ocmts_queue_write_u32(ocmts, wdts, &wdt_unlock);
 			if (ret)
 				goto sequence_err;
-			ret = ocmts_queue_write_u32(ocmts, TC2X_WDTS_CON0, &endinit_set);
+			ret = ocmts_queue_write_u32(ocmts, wdts, &endinit_set);
 			if (ret)
 				goto sequence_err;
 		}
@@ -1019,6 +1060,8 @@ static int aurix_eflash_erase(struct flash_bank *bank, unsigned int first, unsig
 		 * The OCMTS delay for the next instruction is sufficient. */
 sequence_err:
 		if (ret) {
+			if (endinit_guard)
+				aurix_eflash_endinit_restore(ocmts, wdts, wdt_unlock, endinit_set);
 			ret = aurix_eflash_reset_to_read(bank);
 			if (ret) {
 				LOG_WARNING("Failed to reset flash to read mode. Please reset device to continue");
@@ -1340,14 +1383,17 @@ static int aurix_eflash_write(struct flash_bank *bank, const uint8_t *buffer, ui
 	struct ocmts *ocmts = target_to_tricore(bank->target)->ocmts;
 	uint32_t wdts_con0 = 0;
 	uint32_t page_offset = 0;
+	const target_addr_t wdts = aurix_eflash_safety_wdt(aurix_bank);
+	bool endinit_guard = false;
 	int ret;
 
-	if (aurix_bank->family == AURIX_EFLASH_TC2X && aurix_bank->type == AURIX_EFLASH_PFLASH) {
-		ret = ocmts_io_read_u32(ocmts, TC2X_WDTS_CON0, &wdts_con0);
+	if (wdts) {
+		ret = ocmts_io_read_u32(ocmts, wdts, &wdts_con0);
 		if (ret) {
-			LOG_ERROR("Failed to read TC2X watchdog control register");
+			LOG_ERROR("Failed to read safety watchdog control register");
 			return ret;
 		}
+		endinit_guard = aurix_eflash_endinit_guard(aurix_bank, wdts_con0);
 	}
 
 	if (aurix_bank->type == AURIX_EFLASH_UCB && aurix_bank->ucb_unlocked == false) {
@@ -1395,6 +1441,8 @@ fallback:
 			(aurix_bank->family == AURIX_EFLASH_TC2X ? 0x7A : 0xA6) : 0xAA;
 		uint32_t zero = 0;
 		uint32_t i;
+		/* Put address always in segment 0xA */
+		uint32_t addr = (~0xF0000000 & (bank->base + offset + page_offset)) + 0xA0000000;
 
 		ret = aurix_eflash_clear_status(bank);
 		if (ret) {
@@ -1416,14 +1464,8 @@ fallback:
 			}
 			/* Clear status to reset request done from load page*/
 			ret = ocmts_queue_write_u32(ocmts, aurix_bank->cmd_addr + 0x5554, &clear_status_key);
-			if (ret) {
-				ret = aurix_eflash_reset_to_read(bank);
-				if (ret) {
-					LOG_ERROR("Failed to reset flash to read mode. Please reset device to continue");
-				}
-				LOG_ERROR("Flash program failed: failed to clear flash status");
-				return ret;
-			}
+			if (ret)
+				goto err;
 		} else {
 			for (i = 0; i < copy_size; i += 4) {
 				ret = ocmts_queue_write_u32(ocmts, aurix_bank->cmd_addr + 0x55F0 + ((i % 8) == 0 ? 0 : 4),
@@ -1433,17 +1475,15 @@ fallback:
 			}
 		}
 
-		if (aurix_bank->family == AURIX_EFLASH_TC2X && aurix_bank->type == AURIX_EFLASH_PFLASH) {
-			ret = ocmts_queue_write_u32(ocmts, TC2X_WDTS_CON0, &wdt_unlock);
+		if (endinit_guard) {
+			ret = ocmts_queue_write_u32(ocmts, wdts, &wdt_unlock);
 			if (ret)
 				goto err;
-			ret = ocmts_queue_write_u32(ocmts, TC2X_WDTS_CON0, &endinit_clear);
+			ret = ocmts_queue_write_u32(ocmts, wdts, &endinit_clear);
 			if (ret)
 				goto err;
 		}
 
-		/* Put address always in segment 0xA */
-		uint32_t addr = (~0xF0000000 & (bank->base + offset + page_offset)) + 0xA0000000;
 		page_offset += copy_size;
 		/* Execute page write sequence */
 		ret = ocmts_queue_write_u32(ocmts, aurix_bank->cmd_addr + 0xAA50, &addr);
@@ -1461,17 +1501,19 @@ fallback:
 		if (ret)
 			goto err;
 
-		if (aurix_bank->family == AURIX_EFLASH_TC2X && aurix_bank->type == AURIX_EFLASH_PFLASH) {
-			ret = ocmts_queue_write_u32(ocmts, TC2X_WDTS_CON0, &wdt_unlock);
+		if (endinit_guard) {
+			ret = ocmts_queue_write_u32(ocmts, wdts, &wdt_unlock);
 			if (ret)
-				return ret;
-			ret = ocmts_queue_write_u32(ocmts, TC2X_WDTS_CON0, &endinit_set);
+				goto err;
+			ret = ocmts_queue_write_u32(ocmts, wdts, &endinit_set);
 			if (ret)
 				goto err;
 		}
 		ret = ocmts_run(ocmts);
 err:
 		if (ret) {
+			if (endinit_guard)
+				aurix_eflash_endinit_restore(ocmts, wdts, wdt_unlock, endinit_set);
 			ret = aurix_eflash_reset_to_read(bank);
 			if (ret) {
 				LOG_ERROR("Failed to reset flash to read mode. Please reset device to continue");

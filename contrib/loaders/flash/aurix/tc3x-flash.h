@@ -14,6 +14,8 @@
 #endif
 
 #define HOST_CMD_ADDR 0xAF000000u
+/* Safety WDT CON0, SCU_WDTS_CON0 in iLLD */
+#define TC3X_WDTS_CON0 (*(volatile uint32_t *)0xF00362A8u)
 #define DMU_HF_STATUS_ADDR 0xF8040010u
 #define DMU_HF_ERRSR_ADDR 0xF8040034u
 #define STM0_TIM0SV_ADDR 0xF0001050u
