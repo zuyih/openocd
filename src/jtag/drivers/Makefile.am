@@ -191,6 +191,7 @@ DRIVERFILES += %D%/openjtag.c
 endif
 if CMSIS_DAP_CORE
 DRIVERFILES += %D%/cmsis_dap.c
+DRIVERFILES += %D%/cmsis_dap_wch.c
 endif
 if CMSIS_DAP_HID
 DRIVERFILES += %D%/cmsis_dap_usb_hid.c

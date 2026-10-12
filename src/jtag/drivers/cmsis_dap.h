@@ -33,6 +33,9 @@ struct pending_request_block {
 struct cmsis_dap {
 	struct cmsis_dap_backend_data *bdata;
 	const struct cmsis_dap_backend *backend;
+	/* USB IDs of the probe, 0 for the TCP backend */
+	uint16_t vid;
+	uint16_t pid;
 	unsigned int packet_size;
 	unsigned int packet_usable_size;
 	unsigned int packet_buffer_size;
@@ -87,6 +90,10 @@ extern const struct cmsis_dap_backend cmsis_dap_usb_backend;
 extern const struct cmsis_dap_backend cmsis_dap_tcp_backend;
 extern const struct command_registration cmsis_dap_usb_subcommand_handlers[];
 extern const struct command_registration cmsis_dap_tcp_subcommand_handlers[];
+
+/* WCH-Link support, cmsis_dap_wch.c */
+extern const struct command_registration cmsis_dap_wch_command_handlers[];
+void cmsis_dap_wch_open(struct cmsis_dap *dap);
 
 #define REPORT_ID_SIZE   1
 

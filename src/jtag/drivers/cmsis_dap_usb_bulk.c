@@ -376,6 +376,8 @@ static int cmsis_dap_usb_open(struct cmsis_dap *dap, const uint16_t vids[], cons
 			dap->bdata->ep_out = ep_out;
 			dap->bdata->ep_in = ep_in;
 			dap->bdata->interface = interface_num;
+			dap->vid = dev_desc.idVendor;
+			dap->pid = dev_desc.idProduct;
 
 			for (unsigned int idx = 0; idx < MAX_PENDING_REQUESTS; idx++) {
 				dap->bdata->command_transfers[idx].status = CMSIS_DAP_TRANSFER_IDLE;

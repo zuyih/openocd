@@ -307,6 +307,9 @@ static int cmsis_dap_open(void)
 
 	cmsis_dap_handle = dap;
 
+	/* vendor commands of WCH-Link probes, as the WCH fork of OpenOCD */
+	cmsis_dap_wch_open(dap);
+
 	return ERROR_OK;
 }
 
@@ -2417,6 +2420,10 @@ static const struct command_registration cmsis_dap_command_handlers[] = {
 		.help = "perform CMSIS-DAP management",
 		.usage = "<cmd>",
 		.chain = cmsis_dap_subcommand_handlers,
+	},
+	{
+		/* top level commands of the WCH fork of OpenOCD */
+		.chain = cmsis_dap_wch_command_handlers,
 	},
 	COMMAND_REGISTRATION_DONE
 };

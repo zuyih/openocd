@@ -184,6 +184,8 @@ static int cmsis_dap_hid_open(struct cmsis_dap *dap, const uint16_t vids[], cons
 	 * hardcoding a match by VID/PID */
 
 	dap->bdata->dev_handle = dev;
+	dap->vid = target_vid;
+	dap->pid = target_pid;
 
 	int retval = cmsis_dap_hid_alloc(dap, packet_size);
 	if (retval != ERROR_OK) {

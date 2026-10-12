@@ -2735,6 +2735,19 @@ from them and send it to the adapter. The first 4 bytes of the adapter response
 are logged.
 See @url{https://arm-software.github.io/CMSIS_5/DAP/html/group__DAP__Commands__gr.html}
 @end deffn
+
+A WCH-Link in DAP mode (USB ID 1a86:8012) gets the vendor commands of the WCH
+fork of OpenOCD when it is opened. Other CMSIS-DAP adapters get none, and the
+following commands are ignored for them.
+
+@deffn {Config Command} {chip_id} (@option{CH32F1x}|@option{CH32F10x}|@option{CH32F2x}|@option{CH32F20x})
+Set the CH32F family of the target for @command{flash_protect}.
+@end deffn
+
+@deffn {Config Command} {flash_protect} (@option{on}|@option{off})
+Enable or disable the read protection of the CH32F through the WCH-Link
+firmware when the adapter is opened. Needs @command{chip_id}.
+@end deffn
 @end deffn
 
 @deffn {Interface Driver} {dummy}
@@ -9060,6 +9073,21 @@ correct bank config.
 @example
 flash bank $_FLASHNAME w600 0x08000000 0 0 0 $_TARGETNAMEs
 @end example
+@end deffn
+
+@deffn {Flash Driver} {wch_arm}
+The WCH CH32F10x and CH32F20x microcontrollers (Cortex-M3). The flash is
+written with the fast page programming of these chips, the chip and its flash
+size are probed. Driver and command names are the ones of the WCH fork of
+OpenOCD.
+
+@example
+flash bank $_FLASHNAME wch_arm 0x08000000 0 0 0 $_TARGETNAME
+@end example
+
+@deffn {Command} {ch32f1x mass_erase} bank_id
+Mass erases the entire flash device.
+@end deffn
 @end deffn
 
 @deffn {Flash Driver} {xmc1xxx}

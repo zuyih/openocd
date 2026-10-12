@@ -338,6 +338,7 @@ extern const struct flash_driver tc4x_rram;
 extern const struct flash_driver tms470_flash;
 extern const struct flash_driver virtual_flash;
 extern const struct flash_driver w600_flash;
+extern const struct flash_driver wch_arm_flash;
 extern const struct flash_driver xcf_flash;
 extern const struct flash_driver xmc1xxx_flash;
 extern const struct flash_driver xmc4xxx_flash;
