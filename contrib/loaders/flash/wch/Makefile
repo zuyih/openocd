@@ -11,7 +11,7 @@ OBJDUMP=$(CROSS_COMPILE)objdump
 
 AFLAGS = -static -nostartfiles -mlittle-endian -Wa,-EL
 
-all: ch32f1x.inc ch32f2x.inc
+all: ch32f1x.inc ch32f2x.inc ch579.inc
 
 .PHONY: clean
 

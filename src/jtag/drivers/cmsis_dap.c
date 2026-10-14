@@ -1484,9 +1484,11 @@ static int cmsis_dap_init(void)
 		goto init_err;
 
 	/* Ask CMSIS-DAP to automatically retry on receiving WAIT for
-	 * up to 64 times. This must be changed to 0 if sticky
-	 * overrun detection is enabled. */
-	retval = cmsis_dap_cmd_dap_tfer_configure(0, 64, 0);
+	 * up to 65535 times: a flash erase of e.g. the WCH CH579 stalls
+	 * the bus for about 2 ms, 64 retries are too short at higher
+	 * SWD clocks. This must be changed to 0 if sticky overrun
+	 * detection is enabled. */
+	retval = cmsis_dap_cmd_dap_tfer_configure(0, 0xFFFF, 0);
 	if (retval != ERROR_OK)
 		goto init_err;
 

@@ -7419,6 +7419,18 @@ flash bank $_FLASHNAME cc3220sf 0 0 0 0 $_TARGETNAME
 @end example
 @end deffn
 
+@deffn {Flash Driver} {ch579}
+The WCH CH579 Bluetooth LE microcontroller (Cortex-M0). The code flash at 0
+and the data flash are separate banks, their sizes are probed. After power on
+the chip runs its boot loader, which is mapped at 0 instead of the code flash
+until the target is reset.
+
+@example
+flash bank $_CHIPNAME.flash ch579 0x00000000 0 0 0 $_TARGETNAME
+flash bank $_CHIPNAME.dflash ch579 0x0003E800 0 0 0 $_TARGETNAME
+@end example
+@end deffn
+
 @deffn {Flash Driver} {efm32}
 All members of the EFM32/EFR32 microcontroller family from Silicon Labs (former
 Energy Micro) include internal flash and use Arm Cortex-M3, Cortex-M4 or
